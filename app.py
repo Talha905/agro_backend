@@ -45,7 +45,7 @@ async def predict_disease(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        image = image.resize((224, 224))
+        image = image.resize((256, 256))
 
         input_data = np.expand_dims(image, axis=0)
 
