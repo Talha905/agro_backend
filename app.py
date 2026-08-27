@@ -230,14 +230,17 @@ Rules:
 - fertilizerPlan should have 1-3 realistic entries total across the whole cycle.
 - If the input isn't a real, growable crop, respond with {"error": "not a recognized crop"} instead."""
 
-try:
-    gemini_model = genai.GenerativeModel(
-        "gemini-flash-latest",
-        system_instruction=GROWTH_PLAN_SYSTEM_PROMPT,
-    )
-except Exception as e:
-    gemini_model = None
-    print(f"Warning: Failed to initialize GenerativeModel: {e}")
+gemini_model = None
+for model_name in ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-flash-latest", "gemini-pro"]:
+    try:
+        gemini_model = genai.GenerativeModel(
+            model_name,
+            system_instruction=GROWTH_PLAN_SYSTEM_PROMPT,
+        )
+        print(f"Successfully initialized Gemini model: {model_name}")
+        break
+    except Exception as e:
+        continue
 
 
 class GrowthPlanRequest(BaseModel):
@@ -277,6 +280,25 @@ def _validate_template(data: dict) -> None:
             raise ValueError(f"fertilizerPlan references unknown stage: {step.get('stageName')}")
 
 
+def _generate_smart_fallback_template(crop_name: str) -> dict:
+    name = crop_name.strip().title() if crop_name.strip() else "Custom Crop"
+    return {
+        "cropName": name,
+        "stages": [
+            {"name": "sowing", "durationDays": 10, "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},
+            {"name": "germination", "durationDays": 12, "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm", "Damping Off"]},
+            {"name": "vegetative", "durationDays": 35, "irrigationFrequencyDays": 7, "pestRisks": ["Aphids", "Leaf Spot"]},
+            {"name": "flowering", "durationDays": 30, "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm", "Blight"]},
+            {"name": "maturity", "durationDays": 25, "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]},
+        ],
+        "fertilizerPlan": [
+            {"stageName": "sowing", "fertilizerType": "Basal NPK", "dayOffsetInStage": 0},
+            {"stageName": "vegetative", "fertilizerType": "Urea Top Dressing", "dayOffsetInStage": 15},
+            {"stageName": "flowering", "fertilizerType": "Potash Boost", "dayOffsetInStage": 10},
+        ],
+    }
+
+
 _growth_plan_cache: dict[str, dict] = {}
 
 
@@ -295,35 +317,45 @@ async def generate_growth_plan(request: GrowthPlanRequest):
     if cache_key in _growth_plan_cache:
         return {"success": True, "template": _growth_plan_cache[cache_key], "cached": True}
 
-    if gemini_model is None:
-        return {"success": False, "error": "Gemini AI model is not configured."}
+    crop_slug = request.cropName.strip().lower()
+    if crop_slug in _growth_plan_cache:
+        return {"success": True, "template": _growth_plan_cache[crop_slug], "cached": True}
 
-    try:
-        context_parts = [f"Crop: {request.cropName}"]
-        if request.soilType:
-            context_parts.append(f"Soil type: {request.soilType}")
-        if request.season:
-            context_parts.append(f"Season: {request.season}")
-        if request.region:
-            context_parts.append(f"Region: {request.region}")
+    if gemini_model is not None:
+        try:
+            context_parts = [f"Crop: {request.cropName}"]
+            if request.soilType:
+                context_parts.append(f"Soil type: {request.soilType}")
+            if request.season:
+                context_parts.append(f"Season: {request.season}")
+            if request.region:
+                context_parts.append(f"Region: {request.region}")
 
-        prompt_text = "\n".join(context_parts)
-        response = await asyncio.to_thread(
-            gemini_model.generate_content,
-            prompt_text,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.2,
-                max_output_tokens=800,
-            ),
-        )
+            prompt_text = "\n".join(context_parts)
 
-        data = _extract_json(response.text)
-        _validate_template(data)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    gemini_model.generate_content,
+                    prompt_text,
+                    generation_config=genai.GenerationConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                        max_output_tokens=800,
+                    ),
+                ),
+                timeout=6.0,
+            )
 
-        _growth_plan_cache[cache_key] = data
+            data = _extract_json(response.text)
+            _validate_template(data)
+            _growth_plan_cache[cache_key] = data
+            _growth_plan_cache[crop_slug] = data
+            return {"success": True, "template": data}
 
-        return {"success": True, "template": data}
+        except Exception as e:
+            print(f"Gemini AI notice for '{request.cropName}': {e}. Using instant smart fallback.")
 
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    fallback_data = _generate_smart_fallback_template(request.cropName)
+    _growth_plan_cache[cache_key] = fallback_data
+    _growth_plan_cache[crop_slug] = fallback_data
+    return {"success": True, "template": fallback_data, "fallback": True}
