@@ -35,8 +35,8 @@ input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
 with open("class_indices.json", "r") as f:
-    labels = json.load(f)
-    labels = {int(k): v for k, v in labels.items()}
+    raw_labels = json.load(f)
+    labels = {int(v): k for k, v in raw_labels.items()}
 
 
 @app.post("/predict-disease")
