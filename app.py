@@ -39,6 +39,7 @@ with open("class_indices.json", "r") as f:
     labels = {int(v): k for k, v in raw_labels.items()}
 
 
+@app.post("/predict")
 @app.post("/predict-disease")
 async def predict_disease(file: UploadFile = File(...)):
     try:
@@ -101,6 +102,7 @@ class RecommendationRequest(BaseModel):
     longitude: float | None = None
 
 
+@app.post("/recommend_crop")
 @app.post("/recommend-crop")
 async def recommend_crop(req: RecommendationRequest):
     try:
