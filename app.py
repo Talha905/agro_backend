@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import asyncio
+import warnings
 import numpy as np
 import pickle
 import tensorflow as tf
@@ -10,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 import io
+
+warnings.filterwarnings("ignore")
 
 app = FastAPI(title="AgroSaathi ML Backend")
 
@@ -303,10 +307,14 @@ async def generate_growth_plan(request: GrowthPlanRequest):
         if request.region:
             context_parts.append(f"Region: {request.region}")
 
-        response = gemini_model.generate_content(
-            "\n".join(context_parts),
+        prompt_text = "\n".join(context_parts)
+        response = await asyncio.to_thread(
+            gemini_model.generate_content,
+            prompt_text,
             generation_config=genai.GenerationConfig(
                 response_mime_type="application/json",
+                temperature=0.2,
+                max_output_tokens=800,
             ),
         )
 
