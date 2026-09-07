@@ -231,7 +231,7 @@ Rules:
 - If the input isn't a real, growable crop, respond with {"error": "not a recognized crop"} instead."""
 
 gemini_model = None
-for model_name in ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-flash-latest", "gemini-pro"]:
+for model_name in ["gemini-flash-latest"]:
     try:
         gemini_model = genai.GenerativeModel(
             model_name,
