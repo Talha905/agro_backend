@@ -7,7 +7,6 @@ import urllib.request
 import urllib.error
 import numpy as np
 import pickle
-import google.generativeai as genai
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,7 +20,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = FastAPI(
     title="AgroSaathi ML Backend",
     description="Production-ready FastAPI backend for plant disease detection, crop recommendation, AI growth plans, and Ollama qwen2.5:3b disease remedies.",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -36,13 +35,18 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 
 
-def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 30.0) -> dict | None:
+def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 35.0) -> dict | None:
     """Queries local or remote Ollama server running qwen2.5:3b model."""
     url = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_predict": 350,
+            "temperature": 0.2,
+            "top_p": 0.9,
+        }
     }
     if system:
         payload["system"] = system
@@ -207,30 +211,11 @@ async def disease_remedy(req: DiseaseRemedyRequest):
     prompt = f"Disease: {disease}. Crop: {req.cropName or 'Auto-detect'}. Preferred language: {req.language}."
 
     # 1. Try Ollama (qwen2.5:3b)
-    ollama_res = query_ollama(prompt, system=system_prompt, format_json=True, timeout=8.0)
+    ollama_res = query_ollama(prompt, system=system_prompt, format_json=True, timeout=35.0)
     if ollama_res and isinstance(ollama_res, dict) and "organicRemedies" in ollama_res:
         return {"success": True, "source": "ollama_qwen2.5", "remedy": ollama_res}
 
-    # 2. Fallback to Gemini if configured
-    if gemini_model is not None:
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    gemini_model.generate_content,
-                    f"{system_prompt}\n\n{prompt}",
-                    generation_config=genai.GenerationConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
-                ),
-                timeout=6.0,
-            )
-            data = _extract_json(response.text)
-            return {"success": True, "source": "gemini", "remedy": data}
-        except Exception as e:
-            print(f"Gemini remedy error: {e}")
-
-    # 3. Fallback static remedy dictionary
+    # 2. Instant Smart Agronomic Fallback (Zero Gemini, Zero quota errors)
     formatted_name = disease.replace('___', ': ').replace('_', ' ').title()
     return {
         "success": True,
@@ -369,12 +354,8 @@ async def recommend_crop(req: RecommendationRequest):
 
 
 # ----------------------------------------
-# 4. Growth Plan Generation Endpoint (Ollama qwen2.5:3b / Gemini)
+# 4. Growth Plan Generation Endpoint (Ollama qwen2.5:3b)
 # ----------------------------------------
-gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
-if gemini_api_key:
-    genai.configure(api_key=gemini_api_key)
-
 ALLOWED_STAGES = {"sowing", "germination", "vegetative", "flowering", "maturity"}
 
 GROWTH_PLAN_SYSTEM_PROMPT = """You are an agronomy assistant for AgroSaathi, a farming app used in Maharashtra, India.
@@ -405,19 +386,6 @@ Rules:
 - pestRisks should list realistic risks specific to that growth stage, not a generic list repeated on every stage.
 - fertilizerPlan should have 1-3 realistic entries total across the whole cycle.
 - If the input isn't a real, growable crop, respond with {"error": "not a recognized crop"} instead."""
-
-gemini_model = None
-if gemini_api_key:
-    for model_name in ["gemini-flash-latest", "gemini-1.5-flash"]:
-        try:
-            gemini_model = genai.GenerativeModel(
-                model_name,
-                system_instruction=GROWTH_PLAN_SYSTEM_PROMPT,
-            )
-            print(f"Successfully initialized Gemini model: {model_name}")
-            break
-        except Exception as e:
-            continue
 
 
 class GrowthPlanRequest(BaseModel):
@@ -509,7 +477,7 @@ async def generate_growth_plan(request: GrowthPlanRequest):
     prompt_text = "\n".join(context_parts)
 
     # 1. Try Ollama qwen2.5:3b
-    ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=8.0)
+    ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=35.0)
     if ollama_res and isinstance(ollama_res, dict):
         try:
             _validate_template(ollama_res)
@@ -519,32 +487,7 @@ async def generate_growth_plan(request: GrowthPlanRequest):
         except Exception as ve:
             print(f"Ollama template validation notice: {ve}")
 
-    # 2. Try Gemini fallback
-    if gemini_model is not None:
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    gemini_model.generate_content,
-                    prompt_text,
-                    generation_config=genai.GenerationConfig(
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                        max_output_tokens=800,
-                    ),
-                ),
-                timeout=6.0,
-            )
-
-            data = _extract_json(response.text)
-            _validate_template(data)
-            _growth_plan_cache[cache_key] = data
-            _growth_plan_cache[crop_slug] = data
-            return {"success": True, "template": data, "source": "gemini"}
-
-        except Exception as e:
-            print(f"Gemini AI notice for '{request.cropName}': {e}. Using instant smart fallback.")
-
-    # 3. Fallback static template
+    # 2. Instant Smart Agronomic Fallback (Zero Gemini, Zero 429 quota errors)
     fallback_data = _generate_smart_fallback_template(request.cropName)
     _growth_plan_cache[cache_key] = fallback_data
     _growth_plan_cache[crop_slug] = fallback_data
