@@ -5,7 +5,6 @@ import asyncio
 import warnings
 import numpy as np
 import pickle
-import tensorflow as tf
 import google.generativeai as genai
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +14,13 @@ import io
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="AgroSaathi ML Backend")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+app = FastAPI(
+    title="AgroSaathi ML Backend",
+    description="Production-ready FastAPI backend for plant disease detection, crop recommendation, and AI growth plans.",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,28 +30,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render monitoring."""
+    return {
+        "status": "healthy",
+        "service": "AgroSaathi ML Backend",
+        "disease_model_loaded": interpreter is not None,
+        "recommend_model_loaded": recommend_model is not None,
+    }
+
+
 # ----------------------------------------
-# 1. Disease Detection Endpoint
+# 1. Disease Detection Endpoint (TFLite)
 # ----------------------------------------
-tflite_model_path = "plant_disease_model.tflite"
+tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
 if not os.path.exists(tflite_model_path):
-    tflite_model_path = "model.tflite"
+    tflite_model_path = os.path.join(BASE_DIR, "model.tflite")
 
-interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
-interpreter.allocate_tensors()
+interpreter = None
+input_details = None
+output_details = None
 
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+try:
+    try:
+        import tflite_runtime.interpreter as tflite
+        interpreter = tflite.Interpreter(model_path=tflite_model_path)
+    except ImportError:
+        import tensorflow as tf
+        interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
 
-with open("class_indices.json", "r") as f:
-    raw_labels = json.load(f)
-    labels = {int(v): k for k, v in raw_labels.items()}
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    print(f"Loaded TFLite disease model from: {tflite_model_path}")
+except Exception as e:
+    print(f"Warning: Failed to load TFLite disease model ({e})")
+
+labels = {}
+class_indices_path = os.path.join(BASE_DIR, "class_indices.json")
+if os.path.exists(class_indices_path):
+    try:
+        with open(class_indices_path, "r") as f:
+            raw_labels = json.load(f)
+            labels = {int(v): k for k, v in raw_labels.items()}
+    except Exception as e:
+        print(f"Warning: Failed to parse class_indices.json: {e}")
 
 
 @app.post("/predict")
 @app.post("/predict-disease")
 async def predict_disease(file: UploadFile = File(...)):
     try:
+        if interpreter is None:
+            return {
+                "success": False,
+                "error": "Disease model not loaded on server."
+            }
+
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
         image = image.resize((256, 256))
@@ -69,7 +112,7 @@ async def predict_disease(file: UploadFile = File(...)):
         probabilities = exp_output / exp_output.sum()
 
         predicted_index = int(np.argmax(probabilities))
-        predicted_class = labels.get(predicted_index, "Unknown")
+        predicted_class = labels.get(predicted_index, f"Disease Index {predicted_index}")
         confidence = float(probabilities[predicted_index]) * 100.0
 
         return {
@@ -89,10 +132,12 @@ async def predict_disease(file: UploadFile = File(...)):
 # 2. Crop Recommendation Endpoint
 # ----------------------------------------
 recommend_model = None
-if os.path.exists("model.pkl"):
+model_pkl_path = os.path.join(BASE_DIR, "model.pkl")
+if os.path.exists(model_pkl_path):
     try:
-        with open("model.pkl", "rb") as f:
+        with open(model_pkl_path, "rb") as f:
             recommend_model = pickle.load(f)
+            print(f"Loaded crop recommendation model from: {model_pkl_path}")
     except Exception as e:
         print(f"Warning: Failed to load model.pkl: {e}")
 
@@ -197,7 +242,9 @@ async def recommend_crop(req: RecommendationRequest):
 # ----------------------------------------
 # 3. Growth Plan Generation Endpoint (Gemini AI)
 # ----------------------------------------
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key)
 
 ALLOWED_STAGES = {"sowing", "germination", "vegetative", "flowering", "maturity"}
 
@@ -231,16 +278,17 @@ Rules:
 - If the input isn't a real, growable crop, respond with {"error": "not a recognized crop"} instead."""
 
 gemini_model = None
-for model_name in ["gemini-flash-latest"]:
-    try:
-        gemini_model = genai.GenerativeModel(
-            model_name,
-            system_instruction=GROWTH_PLAN_SYSTEM_PROMPT,
-        )
-        print(f"Successfully initialized Gemini model: {model_name}")
-        break
-    except Exception as e:
-        continue
+if gemini_api_key:
+    for model_name in ["gemini-flash-latest", "gemini-1.5-flash"]:
+        try:
+            gemini_model = genai.GenerativeModel(
+                model_name,
+                system_instruction=GROWTH_PLAN_SYSTEM_PROMPT,
+            )
+            print(f"Successfully initialized Gemini model: {model_name}")
+            break
+        except Exception as e:
+            continue
 
 
 class GrowthPlanRequest(BaseModel):
@@ -359,3 +407,9 @@ async def generate_growth_plan(request: GrowthPlanRequest):
     _growth_plan_cache[cache_key] = fallback_data
     _growth_plan_cache[crop_slug] = fallback_data
     return {"success": True, "template": fallback_data, "fallback": True}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
