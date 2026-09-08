@@ -3,6 +3,8 @@ import re
 import json
 import asyncio
 import warnings
+import urllib.request
+import urllib.error
 import numpy as np
 import pickle
 import google.generativeai as genai
@@ -18,8 +20,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(
     title="AgroSaathi ML Backend",
-    description="Production-ready FastAPI backend for plant disease detection, crop recommendation, and AI growth plans.",
-    version="1.0.0"
+    description="Production-ready FastAPI backend for plant disease detection, crop recommendation, AI growth plans, and Ollama qwen2.5:3b disease remedies.",
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -30,6 +32,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+
+
+def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 8.0) -> dict | None:
+    """Queries local or remote Ollama server running qwen2.5:3b model."""
+    url = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+    }
+    if system:
+        payload["system"] = system
+    if format_json:
+        payload["format"] = "json"
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                result = json.loads(resp.read().decode("utf-8"))
+                response_text = result.get("response", "")
+                if format_json:
+                    return json.loads(response_text)
+                return {"response": response_text}
+    except Exception as e:
+        print(f"Ollama query notice ({OLLAMA_MODEL} @ {OLLAMA_HOST}): {e}")
+    return None
+
 
 @app.get("/")
 @app.get("/health")
@@ -38,6 +72,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "AgroSaathi ML Backend",
+        "ollama_model": OLLAMA_MODEL,
         "disease_model_loaded": interpreter is not None,
         "recommend_model_loaded": recommend_model is not None,
     }
@@ -129,7 +164,87 @@ async def predict_disease(file: UploadFile = File(...)):
 
 
 # ----------------------------------------
-# 2. Crop Recommendation Endpoint
+# 2. Disease Remedy Advisor (Ollama qwen2.5:3b)
+# ----------------------------------------
+class DiseaseRemedyRequest(BaseModel):
+    diseaseName: str
+    cropName: str | None = None
+    language: str | None = "English"
+
+
+@app.post("/disease-remedy")
+async def disease_remedy(req: DiseaseRemedyRequest):
+    """Generates AI treatment, cure steps, and prevention measures using qwen2.5:3b via Ollama."""
+    disease = req.diseaseName.strip()
+
+    system_prompt = (
+        "You are an expert plant pathologist and agronomy advisor for Indian farmers. "
+        "Given a plant disease name, output ONLY a JSON object (no markdown fences, no prose before or after) with this exact structure:\n"
+        "{\n"
+        '  "disease": "proper disease name",\n'
+        '  "severity": "Mild | Moderate | Severe",\n'
+        '  "organicRemedies": ["natural or organic cure step 1", "step 2"],\n'
+        '  "chemicalTreatments": ["recommended chemical spray/fungicide with dosage", ...],\n'
+        '  "preventiveMeasures": ["cultural or field practice step 1", ...],\n'
+        '  "summaryAdvice": "1-2 sentence quick advice for the farmer"\n'
+        "}"
+    )
+
+    prompt = f"Disease: {disease}. Crop: {req.cropName or 'Auto-detect'}. Preferred language: {req.language}."
+
+    # 1. Try Ollama (qwen2.5:3b)
+    ollama_res = query_ollama(prompt, system=system_prompt, format_json=True, timeout=8.0)
+    if ollama_res and isinstance(ollama_res, dict) and "organicRemedies" in ollama_res:
+        return {"success": True, "source": "ollama_qwen2.5", "remedy": ollama_res}
+
+    # 2. Fallback to Gemini if configured
+    if gemini_model is not None:
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    gemini_model.generate_content,
+                    f"{system_prompt}\n\n{prompt}",
+                    generation_config=genai.GenerationConfig(
+                        response_mime_type="application/json",
+                        temperature=0.2,
+                    ),
+                ),
+                timeout=6.0,
+            )
+            data = _extract_json(response.text)
+            return {"success": True, "source": "gemini", "remedy": data}
+        except Exception as e:
+            print(f"Gemini remedy error: {e}")
+
+    # 3. Fallback static remedy dictionary
+    formatted_name = disease.replace('___', ': ').replace('_', ' ').title()
+    return {
+        "success": True,
+        "source": "fallback",
+        "remedy": {
+            "disease": formatted_name,
+            "severity": "Moderate",
+            "organicRemedies": [
+                "Spray Neem oil solution (5ml per liter of water) during early morning or late evening.",
+                "Remove and safely destroy severely infected foliage to halt spore spread.",
+                "Apply Trichoderma viride bio-fungicide to soil around the root zone."
+            ],
+            "chemicalTreatments": [
+                "Apply Copper Oxychloride 50 WP (2.5g per liter of water).",
+                "For severe infections, spray Mancozeb 75 WP (2g per liter of water) at 10-14 day intervals."
+            ],
+            "preventiveMeasures": [
+                "Maintain optimum plant spacing to encourage canopy ventilation.",
+                "Avoid overhead sprinkler irrigation; use drip lines to keep leaves dry.",
+                "Practice crop rotation with non-host crop families each season."
+            ],
+            "summaryAdvice": f"Isolate infected plants promptly and apply organic neem spray or recommended copper fungicide for {formatted_name}."
+        }
+    }
+
+
+# ----------------------------------------
+# 3. Crop Recommendation Endpoint
 # ----------------------------------------
 recommend_model = None
 model_pkl_path = os.path.join(BASE_DIR, "model.pkl")
@@ -240,7 +355,7 @@ async def recommend_crop(req: RecommendationRequest):
 
 
 # ----------------------------------------
-# 3. Growth Plan Generation Endpoint (Gemini AI)
+# 4. Growth Plan Generation Endpoint (Ollama qwen2.5:3b / Gemini)
 # ----------------------------------------
 gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 if gemini_api_key:
@@ -369,18 +484,30 @@ async def generate_growth_plan(request: GrowthPlanRequest):
     if crop_slug in _growth_plan_cache:
         return {"success": True, "template": _growth_plan_cache[crop_slug], "cached": True}
 
+    context_parts = [f"Crop: {request.cropName}"]
+    if request.soilType:
+        context_parts.append(f"Soil type: {request.soilType}")
+    if request.season:
+        context_parts.append(f"Season: {request.season}")
+    if request.region:
+        context_parts.append(f"Region: {request.region}")
+
+    prompt_text = "\n".join(context_parts)
+
+    # 1. Try Ollama qwen2.5:3b
+    ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=8.0)
+    if ollama_res and isinstance(ollama_res, dict):
+        try:
+            _validate_template(ollama_res)
+            _growth_plan_cache[cache_key] = ollama_res
+            _growth_plan_cache[crop_slug] = ollama_res
+            return {"success": True, "template": ollama_res, "source": "ollama_qwen2.5"}
+        except Exception as ve:
+            print(f"Ollama template validation notice: {ve}")
+
+    # 2. Try Gemini fallback
     if gemini_model is not None:
         try:
-            context_parts = [f"Crop: {request.cropName}"]
-            if request.soilType:
-                context_parts.append(f"Soil type: {request.soilType}")
-            if request.season:
-                context_parts.append(f"Season: {request.season}")
-            if request.region:
-                context_parts.append(f"Region: {request.region}")
-
-            prompt_text = "\n".join(context_parts)
-
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     gemini_model.generate_content,
@@ -398,11 +525,12 @@ async def generate_growth_plan(request: GrowthPlanRequest):
             _validate_template(data)
             _growth_plan_cache[cache_key] = data
             _growth_plan_cache[crop_slug] = data
-            return {"success": True, "template": data}
+            return {"success": True, "template": data, "source": "gemini"}
 
         except Exception as e:
             print(f"Gemini AI notice for '{request.cropName}': {e}. Using instant smart fallback.")
 
+    # 3. Fallback static template
     fallback_data = _generate_smart_fallback_template(request.cropName)
     _growth_plan_cache[cache_key] = fallback_data
     _growth_plan_cache[crop_slug] = fallback_data
