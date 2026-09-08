@@ -36,7 +36,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 
 
-def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 8.0) -> dict | None:
+def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 30.0) -> dict | None:
     """Queries local or remote Ollama server running qwen2.5:3b model."""
     url = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
     payload = {
@@ -50,7 +50,14 @@ def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeou
         payload["format"] = "json"
 
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "bypass-tunnel-reminder": "true",
+        "Bypass-Tunnel-Reminder": "true",
+        "ngrok-skip-browser-warning": "true",
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -58,7 +65,14 @@ def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeou
                 result = json.loads(resp.read().decode("utf-8"))
                 response_text = result.get("response", "")
                 if format_json:
-                    return json.loads(response_text)
+                    clean_text = response_text.strip()
+                    if clean_text.startswith("```json"):
+                        clean_text = clean_text[7:]
+                    if clean_text.startswith("```"):
+                        clean_text = clean_text[3:]
+                    if clean_text.endswith("```"):
+                        clean_text = clean_text[:-3]
+                    return json.loads(clean_text.strip())
                 return {"response": response_text}
     except Exception as e:
         print(f"Ollama query notice ({OLLAMA_MODEL} @ {OLLAMA_HOST}): {e}")
