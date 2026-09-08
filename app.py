@@ -358,34 +358,23 @@ async def recommend_crop(req: RecommendationRequest):
 # ----------------------------------------
 ALLOWED_STAGES = {"sowing", "germination", "vegetative", "flowering", "maturity"}
 
-GROWTH_PLAN_SYSTEM_PROMPT = """You are an agronomy assistant for AgroSaathi, a farming app used in Maharashtra, India.
-Given a crop name and optional growing conditions, output ONLY a JSON object (no markdown fences, no prose before or after) with this exact shape:
-
-{
-  "cropName": "string, proper-cased crop name",
-  "stages": [
-    {
-      "name": "one of: sowing, germination, vegetative, flowering, maturity",
-      "durationDays": integer > 0,
-      "irrigationFrequencyDays": integer > 0,
-      "pestRisks": ["short pest or disease name", ...]
-    }
-  ],
-  "fertilizerPlan": [
-    {
-      "stageName": "must match one of the stage names above",
-      "fertilizerType": "short string, e.g. 'Basal NPK'",
-      "dayOffsetInStage": integer >= 0
-    }
-  ]
-}
-
-Rules:
-- Include exactly one entry per stage, in this order: sowing, germination, vegetative, flowering, maturity.
-- Base durations and irrigation frequency on real agronomic practice for the given crop and, if provided, the soil/season/region.
-- pestRisks should list realistic risks specific to that growth stage, not a generic list repeated on every stage.
-- fertilizerPlan should have 1-3 realistic entries total across the whole cycle.
-- If the input isn't a real, growable crop, respond with {"error": "not a recognized crop"} instead."""
+GROWTH_PLAN_SYSTEM_PROMPT = (
+    "You are an agronomy expert for Indian crops. Output ONLY valid JSON with 5 stages (sowing, germination, vegetative, flowering, maturity) in this exact structure:\n"
+    "{\n"
+    '  "cropName": "Crop Name",\n'
+    '  "stages": [\n'
+    '    {"name": "sowing", "durationDays": 10, "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},\n'
+    '    {"name": "germination", "durationDays": 12, "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm"]},\n'
+    '    {"name": "vegetative", "durationDays": 35, "irrigationFrequencyDays": 7, "pestRisks": ["Aphids"]},\n'
+    '    {"name": "flowering", "durationDays": 30, "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm"]},\n'
+    '    {"name": "maturity", "durationDays": 25, "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]}\n'
+    '  ],\n'
+    '  "fertilizerPlan": [\n'
+    '    {"stageName": "sowing", "fertilizerType": "Basal NPK", "dayOffsetInStage": 0},\n'
+    '    {"stageName": "vegetative", "fertilizerType": "Urea", "dayOffsetInStage": 15}\n'
+    '  ]\n'
+    "}"
+)
 
 
 class GrowthPlanRequest(BaseModel):
@@ -476,8 +465,8 @@ async def generate_growth_plan(request: GrowthPlanRequest):
 
     prompt_text = "\n".join(context_parts)
 
-    # 1. Try Ollama qwen2.5:3b
-    ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=35.0)
+    # 1. Try Ollama qwen2.5:3b (with 60s timeout)
+    ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=60.0)
     if ollama_res and isinstance(ollama_res, dict):
         try:
             _validate_template(ollama_res)
