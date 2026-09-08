@@ -391,27 +391,102 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
-def _validate_template(data: dict) -> None:
-    if "error" in data:
-        raise ValueError(data["error"])
+def _normalize_and_validate_template(data: dict, default_crop_name: str) -> dict:
+    if not isinstance(data, dict) or "error" in data:
+        raise ValueError(data.get("error", "Invalid data format") if isinstance(data, dict) else "Not a dict")
 
-    stages = data.get("stages")
-    if not isinstance(stages, list) or len(stages) != 5:
-        raise ValueError("expected exactly 5 stages")
+    crop_name = data.get("cropName") or data.get("crop_name") or default_crop_name
+    raw_stages = data.get("stages") or data.get("growth_stages") or []
 
-    seen_names = [s.get("name") for s in stages]
-    if seen_names != ["sowing", "germination", "vegetative", "flowering", "maturity"]:
-        raise ValueError(f"stages out of order or invalid: {seen_names}")
+    if not isinstance(raw_stages, list) or len(raw_stages) < 3:
+        raise ValueError("Insufficient stages returned")
 
-    for stage in stages:
-        if not isinstance(stage.get("durationDays"), int) or stage["durationDays"] <= 0:
-            raise ValueError(f"invalid durationDays for stage {stage.get('name')}")
-        if not isinstance(stage.get("irrigationFrequencyDays"), int) or stage["irrigationFrequencyDays"] <= 0:
-            raise ValueError(f"invalid irrigationFrequencyDays for stage {stage.get('name')}")
+    stage_order = ["sowing", "germination", "vegetative", "flowering", "maturity"]
+    normalized_stages = []
 
-    for step in data.get("fertilizerPlan", []):
-        if step.get("stageName") not in ALLOWED_STAGES:
-            raise ValueError(f"fertilizerPlan references unknown stage: {step.get('stageName')}")
+    for i, s in enumerate(raw_stages):
+        if not isinstance(s, dict):
+            continue
+        raw_name = str(s.get("name") or s.get("stage") or s.get("stage_name") or "").strip().lower()
+        if not raw_name:
+            raw_name = stage_order[i] if i < len(stage_order) else f"stage_{i+1}"
+        
+        matched_name = raw_name
+        for target in stage_order:
+            if target in raw_name:
+                matched_name = target
+                break
+
+        dur = s.get("durationDays") or s.get("duration_days") or s.get("duration") or 14
+        try:
+            dur = int(dur)
+        except (ValueError, TypeError):
+            dur = 14
+
+        irrig = s.get("irrigationFrequencyDays") or s.get("irrigation_frequency_days") or s.get("irrigation") or 7
+        try:
+            irrig = int(irrig)
+        except (ValueError, TypeError):
+            irrig = 7
+
+        pests = s.get("pestRisks") or s.get("pest_risks") or s.get("pests") or []
+        if not isinstance(pests, list):
+            pests = [str(pests)]
+
+        normalized_stages.append({
+            "name": matched_name,
+            "durationDays": max(1, dur),
+            "irrigationFrequencyDays": max(1, irrig),
+            "pestRisks": [str(p) for p in pests if p],
+        })
+
+    existing_names = {s["name"] for s in normalized_stages}
+    for req_stage in stage_order:
+        if req_stage not in existing_names:
+            normalized_stages.append({
+                "name": req_stage,
+                "durationDays": 15,
+                "irrigationFrequencyDays": 7,
+                "pestRisks": ["General Pests"],
+            })
+
+    normalized_stages.sort(key=lambda s: stage_order.index(s["name"]) if s["name"] in stage_order else 99)
+    normalized_stages = normalized_stages[:5]
+
+    raw_fert = data.get("fertilizerPlan") or data.get("fertilizer_plan") or []
+    normalized_fert = []
+    if isinstance(raw_fert, list):
+        for f in raw_fert:
+            if isinstance(f, dict):
+                stg = str(f.get("stageName") or f.get("stage_name") or f.get("stage") or "sowing").strip().lower()
+                matched_stg = "sowing"
+                for target in stage_order:
+                    if target in stg:
+                        matched_stg = target
+                        break
+                ftype = str(f.get("fertilizerType") or f.get("fertilizer_type") or f.get("fertilizer") or "NPK Blend")
+                offset = f.get("dayOffsetInStage") or f.get("day_offset_in_stage") or f.get("day_offset") or 0
+                try:
+                    offset = int(offset)
+                except (ValueError, TypeError):
+                    offset = 0
+                normalized_fert.append({
+                    "stageName": matched_stg,
+                    "fertilizerType": ftype,
+                    "dayOffsetInStage": max(0, offset),
+                })
+
+    if not normalized_fert:
+        normalized_fert = [
+            {"stageName": "sowing", "fertilizerType": "Basal NPK", "dayOffsetInStage": 0},
+            {"stageName": "vegetative", "fertilizerType": "Urea Top Dressing", "dayOffsetInStage": 15},
+        ]
+
+    return {
+        "cropName": str(crop_name).title(),
+        "stages": normalized_stages,
+        "fertilizerPlan": normalized_fert,
+    }
 
 
 def _generate_smart_fallback_template(crop_name: str) -> dict:
@@ -469,12 +544,12 @@ async def generate_growth_plan(request: GrowthPlanRequest):
     ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=60.0)
     if ollama_res and isinstance(ollama_res, dict):
         try:
-            _validate_template(ollama_res)
-            _growth_plan_cache[cache_key] = ollama_res
-            _growth_plan_cache[crop_slug] = ollama_res
-            return {"success": True, "template": ollama_res, "source": "ollama_qwen2.5"}
+            cleaned_template = _normalize_and_validate_template(ollama_res, request.cropName)
+            _growth_plan_cache[cache_key] = cleaned_template
+            _growth_plan_cache[crop_slug] = cleaned_template
+            return {"success": True, "template": cleaned_template, "source": "ollama_qwen2.5"}
         except Exception as ve:
-            print(f"Ollama template validation notice: {ve}")
+            print(f"Ollama template normalization notice: {ve}")
 
     # 2. Instant Smart Agronomic Fallback (Zero Gemini, Zero 429 quota errors)
     fallback_data = _generate_smart_fallback_template(request.cropName)
