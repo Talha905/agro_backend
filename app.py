@@ -7,8 +7,12 @@ import urllib.request
 import urllib.error
 import numpy as np
 import pickle
-from fastapi import FastAPI, UploadFile, File
+import time
+from datetime import datetime, timezone
+from collections import deque
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from PIL import Image
 import io
@@ -19,8 +23,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(
     title="AgroSaathi ML Backend",
-    description="Production-ready FastAPI backend for plant disease detection, crop recommendation, AI growth plans, and Ollama qwen2.5:3b disease remedies.",
-    version="1.2.0"
+    description="Production-ready FastAPI backend for plant disease detection, crop recommendation, AI growth plans, and Ollama qwen2.5:3b disease remedies with live UI Dashboard.",
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -34,9 +38,22 @@ app.add_middleware(
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 
+# In-memory Request Log Ring Buffer (Max 100 logs)
+MAX_LOGS = 100
+REQUEST_LOGS = deque(maxlen=MAX_LOGS)
+LOG_COUNTER = 0
 
-def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 35.0) -> dict | None:
-    """Queries local or remote Ollama server running qwen2.5:3b model."""
+
+def record_log(log_data: dict):
+    global LOG_COUNTER
+    LOG_COUNTER += 1
+    log_data["id"] = LOG_COUNTER
+    REQUEST_LOGS.appendleft(log_data)
+
+
+def query_ollama_detailed(prompt: str, system: str = "", format_json: bool = True, timeout: float = 35.0) -> tuple[dict | None, float, str, str | None]:
+    """Queries local or remote Ollama server running qwen2.5:3b model and returns detailed diagnostics."""
+    start_time = time.time()
     url = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
     payload = {
         "model": OLLAMA_MODEL,
@@ -65,6 +82,7 @@ def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeou
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            elapsed = time.time() - start_time
             if resp.status == 200:
                 result = json.loads(resp.read().decode("utf-8"))
                 response_text = result.get("response", "")
@@ -76,11 +94,27 @@ def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeou
                         clean_text = clean_text[3:]
                     if clean_text.endswith("```"):
                         clean_text = clean_text[:-3]
-                    return json.loads(clean_text.strip())
-                return {"response": response_text}
+                    return json.loads(clean_text.strip()), elapsed, "success", None
+                return {"response": response_text}, elapsed, "success", None
+            else:
+                return None, elapsed, "error", f"HTTP Status {resp.status}"
+    except urllib.error.URLError as e:
+        elapsed = time.time() - start_time
+        err_msg = str(e.reason) if hasattr(e, "reason") else str(e)
+        if "timed out" in err_msg.lower() or "timeout" in err_msg.lower():
+            return None, elapsed, "timeout", f"Read operation timed out after {round(elapsed, 1)}s"
+        return None, elapsed, "error", err_msg
     except Exception as e:
-        print(f"Ollama query notice ({OLLAMA_MODEL} @ {OLLAMA_HOST}): {e}")
-    return None
+        elapsed = time.time() - start_time
+        err_str = str(e)
+        if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+            return None, elapsed, "timeout", f"Read operation timed out after {round(elapsed, 1)}s"
+        return None, elapsed, "error", err_str
+
+
+def query_ollama(prompt: str, system: str = "", format_json: bool = True, timeout: float = 35.0) -> dict | None:
+    res, _, _, _ = query_ollama_detailed(prompt, system=system, format_json=format_json, timeout=timeout)
+    return res
 
 
 @app.get("/")
@@ -91,8 +125,10 @@ async def health_check():
         "status": "healthy",
         "service": "AgroSaathi ML Backend",
         "ollama_model": OLLAMA_MODEL,
+        "ollama_host": OLLAMA_HOST,
         "disease_model_loaded": interpreter is not None,
         "recommend_model_loaded": recommend_model is not None,
+        "dashboard_url": "/dashboard",
     }
 
 
@@ -135,13 +171,28 @@ if os.path.exists(class_indices_path):
 
 @app.post("/predict")
 @app.post("/predict-disease")
-async def predict_disease(file: UploadFile = File(...)):
+async def predict_disease(request: Request, file: UploadFile = File(...)):
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    filename = file.filename or "uploaded_image.jpg"
     try:
         if interpreter is None:
-            return {
-                "success": False,
-                "error": "Disease model not loaded on server."
-            }
+            res_body = {"success": False, "error": "Disease model not loaded on server."}
+            dur = round((time.time() - start_time) * 1000, 1)
+            record_log({
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "endpoint": "/predict-disease",
+                "method": "POST",
+                "client_ip": client_ip,
+                "request_body": {"filename": filename, "content_type": file.content_type},
+                "ollama_attempt": {"status": "skipped", "duration_sec": 0, "host": OLLAMA_HOST, "model": OLLAMA_MODEL},
+                "source": "tflite_error",
+                "response_status": 500,
+                "response_sent": True,
+                "response_body": res_body,
+                "total_duration_ms": dur
+            })
+            return res_body
 
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -168,17 +219,44 @@ async def predict_disease(file: UploadFile = File(...)):
         predicted_class = labels.get(predicted_index, f"Disease Index {predicted_index}")
         confidence = float(probabilities[predicted_index]) * 100.0
 
-        return {
+        res_body = {
             "success": True,
             "disease": predicted_class,
             "confidence": round(confidence, 2)
         }
+        dur = round((time.time() - start_time) * 1000, 1)
+        record_log({
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "endpoint": "/predict-disease",
+            "method": "POST",
+            "client_ip": client_ip,
+            "request_body": {"filename": filename, "image_size_bytes": len(contents)},
+            "ollama_attempt": {"status": "skipped", "duration_sec": 0, "host": OLLAMA_HOST, "model": OLLAMA_MODEL},
+            "source": "tflite_model",
+            "response_status": 200,
+            "response_sent": True,
+            "response_body": res_body,
+            "total_duration_ms": dur
+        })
+        return res_body
 
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        res_body = {"success": False, "error": str(e)}
+        dur = round((time.time() - start_time) * 1000, 1)
+        record_log({
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "endpoint": "/predict-disease",
+            "method": "POST",
+            "client_ip": client_ip,
+            "request_body": {"filename": filename},
+            "ollama_attempt": {"status": "skipped", "duration_sec": 0, "host": OLLAMA_HOST, "model": OLLAMA_MODEL},
+            "source": "tflite_error",
+            "response_status": 500,
+            "response_sent": True,
+            "response_body": res_body,
+            "total_duration_ms": dur
+        })
+        return res_body
 
 
 # ----------------------------------------
@@ -191,8 +269,10 @@ class DiseaseRemedyRequest(BaseModel):
 
 
 @app.post("/disease-remedy")
-async def disease_remedy(req: DiseaseRemedyRequest):
+async def disease_remedy(req: DiseaseRemedyRequest, request: Request):
     """Generates AI treatment, cure steps, and prevention measures using qwen2.5:3b via Ollama."""
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
     disease = req.diseaseName.strip()
 
     system_prompt = (
@@ -211,35 +291,61 @@ async def disease_remedy(req: DiseaseRemedyRequest):
     prompt = f"Disease: {disease}. Crop: {req.cropName or 'Auto-detect'}. Preferred language: {req.language}."
 
     # 1. Try Ollama (qwen2.5:3b)
-    ollama_res = query_ollama(prompt, system=system_prompt, format_json=True, timeout=35.0)
-    if ollama_res and isinstance(ollama_res, dict) and "organicRemedies" in ollama_res:
-        return {"success": True, "source": "ollama_qwen2.5", "remedy": ollama_res}
+    ollama_res, dur_sec, ollama_status, ollama_err = query_ollama_detailed(prompt, system=system_prompt, format_json=True, timeout=35.0)
 
-    # 2. Instant Smart Agronomic Fallback (Zero Gemini, Zero quota errors)
-    formatted_name = disease.replace('___', ': ').replace('_', ' ').title()
-    return {
-        "success": True,
-        "source": "fallback",
-        "remedy": {
-            "disease": formatted_name,
-            "severity": "Moderate",
-            "organicRemedies": [
-                "Spray Neem oil solution (5ml per liter of water) during early morning or late evening.",
-                "Remove and safely destroy severely infected foliage to halt spore spread.",
-                "Apply Trichoderma viride bio-fungicide to soil around the root zone."
-            ],
-            "chemicalTreatments": [
-                "Apply Copper Oxychloride 50 WP (2.5g per liter of water).",
-                "For severe infections, spray Mancozeb 75 WP (2g per liter of water) at 10-14 day intervals."
-            ],
-            "preventiveMeasures": [
-                "Maintain optimum plant spacing to encourage canopy ventilation.",
-                "Avoid overhead sprinkler irrigation; use drip lines to keep leaves dry.",
-                "Practice crop rotation with non-host crop families each season."
-            ],
-            "summaryAdvice": f"Isolate infected plants promptly and apply organic neem spray or recommended copper fungicide for {formatted_name}."
+    if ollama_res and isinstance(ollama_res, dict) and "organicRemedies" in ollama_res:
+        resp_data = {"success": True, "source": "ollama_qwen2.5", "remedy": ollama_res}
+        source_used = "ollama_qwen2.5"
+    else:
+        formatted_name = disease.replace('___', ': ').replace('_', ' ').title()
+        resp_data = {
+            "success": True,
+            "source": "fallback",
+            "remedy": {
+                "disease": formatted_name,
+                "severity": "Moderate",
+                "organicRemedies": [
+                    "Spray Neem oil solution (5ml per liter of water) during early morning or late evening.",
+                    "Remove and safely destroy severely infected foliage to halt spore spread.",
+                    "Apply Trichoderma viride bio-fungicide to soil around the root zone."
+                ],
+                "chemicalTreatments": [
+                    "Apply Copper Oxychloride 50 WP (2.5g per liter of water).",
+                    "For severe infections, spray Mancozeb 75 WP (2g per liter of water) at 10-14 day intervals."
+                ],
+                "preventiveMeasures": [
+                    "Maintain optimum plant spacing to encourage canopy ventilation.",
+                    "Avoid overhead sprinkler irrigation; use drip lines to keep leaves dry.",
+                    "Practice crop rotation with non-host crop families each season."
+                ],
+                "summaryAdvice": f"Isolate infected plants promptly and apply organic neem spray or recommended copper fungicide for {formatted_name}."
+            }
         }
-    }
+        source_used = "fallback"
+
+    total_dur_ms = round((time.time() - start_time) * 1000, 1)
+
+    record_log({
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "endpoint": "/disease-remedy",
+        "method": "POST",
+        "client_ip": client_ip,
+        "request_body": req.dict(),
+        "ollama_attempt": {
+            "host": OLLAMA_HOST,
+            "model": OLLAMA_MODEL,
+            "duration_sec": round(dur_sec, 2),
+            "status": ollama_status,
+            "error": ollama_err,
+        },
+        "source": source_used,
+        "response_status": 200,
+        "response_sent": True,
+        "response_body": resp_data,
+        "total_duration_ms": total_dur_ms,
+    })
+
+    return resp_data
 
 
 # ----------------------------------------
@@ -267,7 +373,9 @@ class RecommendationRequest(BaseModel):
 
 @app.post("/recommend_crop")
 @app.post("/recommend-crop")
-async def recommend_crop(req: RecommendationRequest):
+async def recommend_crop(req: RecommendationRequest, request: Request):
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
     try:
         crop_metadata = {
             "wheat": {"name": "Wheat (गेहूँ)", "yieldPerAcre": 18.0, "price": 2275, "cost": 14000, "water": "medium", "risk": "low", "days": 120, "window": "Oct - Nov"},
@@ -344,13 +452,43 @@ async def recommend_crop(req: RecommendationRequest):
                 "estimatedCost": round(est_cost, 0)
             })
 
-        return {
+        res_body = {
             "success": True,
             "count": len(recommendations),
             "recommendations": recommendations
         }
+        total_dur_ms = round((time.time() - start_time) * 1000, 1)
+        record_log({
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "endpoint": "/recommend-crop",
+            "method": "POST",
+            "client_ip": client_ip,
+            "request_body": req.dict(),
+            "ollama_attempt": {"status": "skipped", "duration_sec": 0, "host": OLLAMA_HOST, "model": OLLAMA_MODEL},
+            "source": "pickle_model" if recommend_model is not None else "rule_engine",
+            "response_status": 200,
+            "response_sent": True,
+            "response_body": res_body,
+            "total_duration_ms": total_dur_ms,
+        })
+        return res_body
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        res_body = {"success": False, "error": str(e)}
+        total_dur_ms = round((time.time() - start_time) * 1000, 1)
+        record_log({
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "endpoint": "/recommend-crop",
+            "method": "POST",
+            "client_ip": client_ip,
+            "request_body": req.dict(),
+            "ollama_attempt": {"status": "skipped", "duration_sec": 0, "host": OLLAMA_HOST, "model": OLLAMA_MODEL},
+            "source": "error",
+            "response_status": 500,
+            "response_sent": True,
+            "response_body": res_body,
+            "total_duration_ms": total_dur_ms,
+        })
+        return res_body
 
 
 # ----------------------------------------
@@ -521,14 +659,30 @@ def _cache_key(request: "GrowthPlanRequest") -> str:
 
 
 @app.post("/generate-growth-plan")
-async def generate_growth_plan(request: GrowthPlanRequest):
+async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
+    start_time = time.time()
+    client_ip = req_obj.client.host if req_obj.client else "unknown"
     cache_key = _cache_key(request)
-    if cache_key in _growth_plan_cache:
-        return {"success": True, "template": _growth_plan_cache[cache_key], "cached": True}
-
     crop_slug = request.cropName.strip().lower()
-    if crop_slug in _growth_plan_cache:
-        return {"success": True, "template": _growth_plan_cache[crop_slug], "cached": True}
+
+    if cache_key in _growth_plan_cache or crop_slug in _growth_plan_cache:
+        cached_tpl = _growth_plan_cache.get(cache_key) or _growth_plan_cache.get(crop_slug)
+        res_body = {"success": True, "template": cached_tpl, "cached": True}
+        total_dur_ms = round((time.time() - start_time) * 1000, 1)
+        record_log({
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "endpoint": "/generate-growth-plan",
+            "method": "POST",
+            "client_ip": client_ip,
+            "request_body": request.dict(),
+            "ollama_attempt": {"status": "skipped_cache_hit", "duration_sec": 0, "host": OLLAMA_HOST, "model": OLLAMA_MODEL},
+            "source": "in_memory_cache",
+            "response_status": 200,
+            "response_sent": True,
+            "response_body": res_body,
+            "total_duration_ms": total_dur_ms,
+        })
+        return res_body
 
     context_parts = [f"Crop: {request.cropName}"]
     if request.soilType:
@@ -541,21 +695,558 @@ async def generate_growth_plan(request: GrowthPlanRequest):
     prompt_text = "\n".join(context_parts)
 
     # 1. Try Ollama qwen2.5:3b (with 60s timeout)
-    ollama_res = query_ollama(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=60.0)
+    ollama_res, dur_sec, ollama_status, ollama_err = query_ollama_detailed(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=60.0)
+
     if ollama_res and isinstance(ollama_res, dict):
         try:
             cleaned_template = _normalize_and_validate_template(ollama_res, request.cropName)
             _growth_plan_cache[cache_key] = cleaned_template
             _growth_plan_cache[crop_slug] = cleaned_template
-            return {"success": True, "template": cleaned_template, "source": "ollama_qwen2.5"}
+            res_body = {"success": True, "template": cleaned_template, "source": "ollama_qwen2.5"}
+            total_dur_ms = round((time.time() - start_time) * 1000, 1)
+            record_log({
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "endpoint": "/generate-growth-plan",
+                "method": "POST",
+                "client_ip": client_ip,
+                "request_body": request.dict(),
+                "ollama_attempt": {
+                    "host": OLLAMA_HOST,
+                    "model": OLLAMA_MODEL,
+                    "duration_sec": round(dur_sec, 2),
+                    "status": ollama_status,
+                    "error": ollama_err,
+                },
+                "source": "ollama_qwen2.5",
+                "response_status": 200,
+                "response_sent": True,
+                "response_body": res_body,
+                "total_duration_ms": total_dur_ms,
+            })
+            return res_body
         except Exception as ve:
             print(f"Ollama template normalization notice: {ve}")
+            if not ollama_err:
+                ollama_err = f"Template normalization error: {ve}"
 
     # 2. Instant Smart Agronomic Fallback (Zero Gemini, Zero 429 quota errors)
     fallback_data = _generate_smart_fallback_template(request.cropName)
     _growth_plan_cache[cache_key] = fallback_data
     _growth_plan_cache[crop_slug] = fallback_data
-    return {"success": True, "template": fallback_data, "fallback": True}
+    res_body = {"success": True, "template": fallback_data, "fallback": True}
+    total_dur_ms = round((time.time() - start_time) * 1000, 1)
+    record_log({
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "endpoint": "/generate-growth-plan",
+        "method": "POST",
+        "client_ip": client_ip,
+        "request_body": request.dict(),
+        "ollama_attempt": {
+            "host": OLLAMA_HOST,
+            "model": OLLAMA_MODEL,
+            "duration_sec": round(dur_sec, 2),
+            "status": ollama_status,
+            "error": ollama_err,
+        },
+        "source": "fallback",
+        "response_status": 200,
+        "response_sent": True,
+        "response_body": res_body,
+        "total_duration_ms": total_dur_ms,
+    })
+    return res_body
+
+
+# ----------------------------------------
+# 5. Live Dashboard & Logging API
+# ----------------------------------------
+@app.get("/api/request-logs")
+async def get_request_logs():
+    logs_list = list(REQUEST_LOGS)
+    total_count = len(logs_list)
+    ollama_successes = sum(1 for l in logs_list if l.get("source") == "ollama_qwen2.5")
+    fallbacks = sum(1 for l in logs_list if l.get("source") == "fallback")
+
+    return {
+        "status": "success",
+        "summary": {
+            "total_requests": total_count,
+            "ollama_successes": ollama_successes,
+            "fallbacks": fallbacks,
+            "ollama_host": OLLAMA_HOST,
+            "ollama_model": OLLAMA_MODEL,
+        },
+        "logs": logs_list
+    }
+
+
+@app.post("/api/clear-logs")
+async def clear_request_logs():
+    REQUEST_LOGS.clear()
+    return {"status": "success", "message": "Request logs cleared."}
+
+
+@app.get("/api/ollama-status")
+async def check_ollama_status():
+    start_t = time.time()
+    url = f"{OLLAMA_HOST.rstrip('/')}/api/tags"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "bypass-tunnel-reminder": "true",
+        "ngrok-skip-browser-warning": "true",
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            elapsed = round((time.time() - start_t) * 1000, 1)
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = [m.get("name") for m in data.get("models", [])]
+                return {
+                    "online": True,
+                    "status": "Connected",
+                    "host": OLLAMA_HOST,
+                    "target_model": OLLAMA_MODEL,
+                    "latency_ms": elapsed,
+                    "available_models": models
+                }
+    except Exception as e:
+        elapsed = round((time.time() - start_t) * 1000, 1)
+        return {
+            "online": False,
+            "status": "Offline / Unreachable",
+            "host": OLLAMA_HOST,
+            "target_model": OLLAMA_MODEL,
+            "latency_ms": elapsed,
+            "error": str(e)
+        }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/logs-ui", response_class=HTMLResponse)
+async def render_dashboard():
+    """Serves an interactive single-page dashboard to monitor backend requests and Ollama performance."""
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AgroSaathi Backend Dashboard & Request Monitor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+  <style>
+    body { background-color: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+    .badge-ollama { background-color: #1e1b4b; color: #818cf8; border: 1px solid #4338ca; }
+    .badge-fallback { background-color: #451a03; color: #fbbf24; border: 1px solid #92400e; }
+    .badge-tflite { background-color: #312e81; color: #c084fc; border: 1px solid #6b21a8; }
+    .badge-pickle { background-color: #064e3b; color: #34d399; border: 1px solid #047857; }
+    pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  </style>
+</head>
+<body class="p-4 md:p-6 min-h-screen flex flex-col">
+  <!-- Header -->
+  <header class="flex flex-col md:flex-row justify-between items-start md:items-center pb-4 mb-6 border-b border-slate-800 gap-4">
+    <div>
+      <div class="flex items-center gap-3">
+        <h1 class="text-2xl font-bold text-emerald-400 flex items-center gap-2">
+          <i class="fa-solid fa-seedling text-emerald-500"></i> AgroSaathi AI Dashboard
+        </h1>
+        <span id="live-badge" class="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-950 text-emerald-400 border border-emerald-800">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> LIVE MONITORING
+        </span>
+      </div>
+      <p class="text-xs text-slate-400 mt-1">Real-time trace analyzer for incoming mobile requests, Ollama qwen2.5 execution, and JSON responses.</p>
+    </div>
+
+    <!-- Actions Bar -->
+    <div class="flex flex-wrap items-center gap-3">
+      <div class="flex items-center bg-slate-800 rounded-lg p-1 text-xs border border-slate-700">
+        <label class="px-2 text-slate-400">Refresh:</label>
+        <select id="refresh-interval" class="bg-slate-900 text-slate-200 border-none rounded px-2 py-1 focus:ring-1 focus:ring-emerald-500 outline-none">
+          <option value="2000" selected>2s</option>
+          <option value="5000">5s</option>
+          <option value="10000">10s</option>
+          <option value="0">Paused</option>
+        </select>
+      </div>
+
+      <button onclick="fetchLogs()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 rounded-lg border border-slate-700 transition flex items-center gap-1.5">
+        <i class="fa-solid fa-rotate-right"></i> Refresh Now
+      </button>
+
+      <button onclick="clearLogs()" class="px-3 py-1.5 bg-red-950/60 hover:bg-red-900/80 text-xs font-semibold text-red-300 border border-red-800/80 rounded-lg transition flex items-center gap-1.5">
+        <i class="fa-solid fa-trash-can"></i> Clear Logs
+      </button>
+    </div>
+  </header>
+
+  <!-- Metric Cards -->
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+    <div class="bg-slate-800/80 border border-slate-700/80 rounded-xl p-4 flex flex-col justify-between shadow-lg">
+      <div class="flex items-center justify-between text-slate-400 text-xs font-semibold mb-2">
+        <span>TOTAL REQUESTS CAPTURED</span>
+        <i class="fa-solid fa-server text-emerald-400 text-sm"></i>
+      </div>
+      <div class="text-3xl font-extrabold text-white" id="card-total-requests">0</div>
+      <div class="text-[11px] text-slate-400 mt-2">Captured in current session (Max 100)</div>
+    </div>
+
+    <div class="bg-slate-800/80 border border-slate-700/80 rounded-xl p-4 flex flex-col justify-between shadow-lg">
+      <div class="flex items-center justify-between text-slate-400 text-xs font-semibold mb-2">
+        <span>OLLAMA QWEN2.5 RESPONSES</span>
+        <i class="fa-solid fa-brain text-indigo-400 text-sm"></i>
+      </div>
+      <div class="text-3xl font-extrabold text-indigo-400" id="card-ollama-successes">0</div>
+      <div class="text-[11px] text-slate-400 mt-2" id="card-ollama-percent">0% of total AI queries</div>
+    </div>
+
+    <div class="bg-slate-800/80 border border-slate-700/80 rounded-xl p-4 flex flex-col justify-between shadow-lg">
+      <div class="flex items-center justify-between text-slate-400 text-xs font-semibold mb-2">
+        <span>SMART FALLBACKS USED</span>
+        <i class="fa-solid fa-shield-halved text-amber-400 text-sm"></i>
+      </div>
+      <div class="text-3xl font-extrabold text-amber-400" id="card-fallbacks">0</div>
+      <div class="text-[11px] text-slate-400 mt-2">Triggered on timeout or tunnel offline</div>
+    </div>
+
+    <div class="bg-slate-800/80 border border-slate-700/80 rounded-xl p-4 flex flex-col justify-between shadow-lg">
+      <div class="flex items-center justify-between text-slate-400 text-xs font-semibold mb-2">
+        <span>OLLAMA TUNNEL CONNECTIVITY</span>
+        <button onclick="checkTunnelStatus()" class="hover:text-emerald-400 transition"><i class="fa-solid fa-arrows-rotate"></i></button>
+      </div>
+      <div class="flex items-center gap-2 mt-1">
+        <span id="tunnel-status-dot" class="w-3 h-3 rounded-full bg-slate-600"></span>
+        <span id="tunnel-status-text" class="text-lg font-bold text-slate-300">Checking...</span>
+      </div>
+      <div class="text-[11px] text-slate-400 mt-2 truncate" id="tunnel-host-info" title="">Host: Loading...</div>
+    </div>
+  </div>
+
+  <!-- Interactive Live Quick Tests -->
+  <div class="bg-slate-800/40 border border-slate-700/60 rounded-xl p-4 mb-6">
+    <div class="text-xs font-bold text-slate-300 mb-3 flex items-center gap-2">
+      <i class="fa-solid fa-flask text-emerald-400"></i> LIVE TEST SIMULATOR (Trigger API requests directly from backend)
+    </div>
+    <div class="flex flex-wrap gap-3">
+      <button onclick="sendTestRemedy('Potato Late Blight')" class="px-3 py-1.5 bg-indigo-900/60 hover:bg-indigo-800 text-xs text-indigo-200 border border-indigo-700 rounded-lg transition">
+        <i class="fa-solid fa-bug mr-1"></i> Test Disease Remedy (Potato Blight)
+      </button>
+      <button onclick="sendTestGrowthPlan('Rice')" class="px-3 py-1.5 bg-emerald-900/60 hover:bg-emerald-800 text-xs text-emerald-200 border border-emerald-700 rounded-lg transition">
+        <i class="fa-solid fa-wheat-awn mr-1"></i> Test Growth Plan (Rice)
+      </button>
+      <button onclick="sendTestCropRec()" class="px-3 py-1.5 bg-teal-900/60 hover:bg-teal-800 text-xs text-teal-200 border border-teal-700 rounded-lg transition">
+        <i class="fa-solid fa-chart-line mr-1"></i> Test Crop Recommendation
+      </button>
+    </div>
+  </div>
+
+  <!-- Filters & Search Toolbar -->
+  <div class="flex flex-col sm:flex-row items-center justify-between gap-4 mb-4">
+    <div class="relative w-full sm:w-80">
+      <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-500 text-xs"></i>
+      <input type="text" id="search-input" onkeyup="filterLogs()" placeholder="Search crop, disease, or payload..." class="w-full bg-slate-800 text-slate-200 text-xs rounded-lg pl-8 pr-3 py-2 border border-slate-700 focus:outline-none focus:border-emerald-500">
+    </div>
+
+    <div class="flex items-center gap-3 w-full sm:w-auto justify-end text-xs">
+      <select id="filter-endpoint" onchange="filterLogs()" class="bg-slate-800 text-slate-200 border border-slate-700 rounded-lg px-3 py-1.5 focus:outline-none focus:border-emerald-500">
+        <option value="ALL">All Endpoints</option>
+        <option value="/disease-remedy">/disease-remedy</option>
+        <option value="/generate-growth-plan">/generate-growth-plan</option>
+        <option value="/predict-disease">/predict-disease</option>
+        <option value="/recommend-crop">/recommend-crop</option>
+      </select>
+
+      <select id="filter-source" onchange="filterLogs()" class="bg-slate-800 text-slate-200 border border-slate-700 rounded-lg px-3 py-1.5 focus:outline-none focus:border-emerald-500">
+        <option value="ALL">All Sources</option>
+        <option value="ollama_qwen2.5">Ollama (qwen2.5:3b)</option>
+        <option value="fallback">Smart Fallback</option>
+        <option value="tflite_model">TFLite Model</option>
+        <option value="pickle_model">Pickle Model</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Logs Table -->
+  <div class="bg-slate-800/60 border border-slate-700/80 rounded-xl overflow-hidden shadow-xl flex-grow flex flex-col">
+    <div class="overflow-x-auto">
+      <table class="w-full text-left text-xs border-collapse">
+        <thead class="bg-slate-900/90 text-slate-400 font-semibold border-b border-slate-700">
+          <tr>
+            <th class="p-3"># / TIME (UTC)</th>
+            <th class="p-3">ENDPOINT</th>
+            <th class="p-3">INPUT REQUEST</th>
+            <th class="p-3">OLLAMA EXECUTION</th>
+            <th class="p-3">SOURCE USED</th>
+            <th class="p-3">LATENCY</th>
+            <th class="p-3">RESPONSE SENT</th>
+          </tr>
+        </thead>
+        <tbody id="logs-tbody" class="divide-y divide-slate-800 text-slate-300">
+          <tr>
+            <td colspan="7" class="p-8 text-center text-slate-500">
+              <i class="fa-solid fa-spinner fa-spin text-lg mb-2"></i><br>Loading live request logs...
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- JSON Modal Viewer -->
+  <div id="json-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 hidden z-50">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl">
+      <div class="p-4 border-b border-slate-800 flex justify-between items-center">
+        <h3 id="modal-title" class="font-bold text-emerald-400 text-sm flex items-center gap-2">
+          <i class="fa-solid fa-code"></i> Request Details
+        </h3>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="p-4 overflow-y-auto flex-grow">
+        <pre id="modal-json" class="bg-slate-950 p-4 rounded-lg text-emerald-300 text-xs overflow-x-auto leading-relaxed border border-slate-800"></pre>
+      </div>
+      <div class="p-3 border-t border-slate-800 flex justify-end gap-2 bg-slate-900/50">
+        <button onclick="copyModalJson()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded-lg border border-slate-700 transition flex items-center gap-1">
+          <i class="fa-solid fa-copy"></i> Copy JSON
+        </button>
+        <button onclick="closeModal()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg transition">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let rawLogs = [];
+    let timer = null;
+
+    async function fetchLogs() {
+      try {
+        const res = await fetch('/api/request-logs');
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        rawLogs = data.logs || [];
+        updateSummaryCards(data.summary);
+        renderLogsTable();
+      } catch (err) {
+        console.error("Failed to fetch logs:", err);
+      }
+    }
+
+    async function checkTunnelStatus() {
+      const dot = document.getElementById('tunnel-status-dot');
+      const text = document.getElementById('tunnel-status-text');
+      const hostInfo = document.getElementById('tunnel-host-info');
+
+      text.innerText = "Pinging...";
+      dot.className = "w-3 h-3 rounded-full bg-amber-400 animate-ping";
+
+      try {
+        const res = await fetch('/api/ollama-status');
+        const data = await res.json();
+        hostInfo.innerText = `Host: ${data.host}`;
+        hostInfo.title = data.host;
+
+        if (data.online) {
+          dot.className = "w-3 h-3 rounded-full bg-emerald-400";
+          text.className = "text-lg font-bold text-emerald-400";
+          text.innerText = `Connected (${data.latency_ms}ms)`;
+        } else {
+          dot.className = "w-3 h-3 rounded-full bg-red-500";
+          text.className = "text-lg font-bold text-red-400";
+          text.innerText = "Offline / Timeout";
+        }
+      } catch (e) {
+        dot.className = "w-3 h-3 rounded-full bg-red-500";
+        text.className = "text-lg font-bold text-red-400";
+        text.innerText = "Error Checking";
+      }
+    }
+
+    function updateSummaryCards(summary) {
+      if (!summary) return;
+      document.getElementById('card-total-requests').innerText = summary.total_requests || 0;
+      document.getElementById('card-ollama-successes').innerText = summary.ollama_successes || 0;
+      document.getElementById('card-fallbacks').innerText = summary.fallbacks || 0;
+
+      const totalAI = (summary.ollama_successes || 0) + (summary.fallbacks || 0);
+      const pct = totalAI > 0 ? Math.round((summary.ollama_successes / totalAI) * 100) : 0;
+      document.getElementById('card-ollama-percent').innerText = `${pct}% of total AI queries`;
+    }
+
+    function renderLogsTable() {
+      const tbody = document.getElementById('logs-tbody');
+      const searchVal = document.getElementById('search-input').value.toLowerCase();
+      const endpointVal = document.getElementById('filter-endpoint').value;
+      const sourceVal = document.getElementById('filter-source').value;
+
+      const filtered = rawLogs.filter(log => {
+        if (endpointVal !== "ALL" && log.endpoint !== endpointVal) return false;
+        if (sourceVal !== "ALL" && log.source !== sourceVal) return false;
+        if (searchVal) {
+          const str = JSON.stringify(log).toLowerCase();
+          if (!str.includes(searchVal)) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="7" class="p-8 text-center text-slate-500">
+              No matching request logs found.
+            </td>
+          </tr>`;
+        return;
+      }
+
+      let html = '';
+      filtered.forEach(log => {
+        // Source Badge
+        let sourceBadge = '';
+        if (log.source === 'ollama_qwen2.5') {
+          sourceBadge = `<span class="badge-ollama px-2 py-0.5 rounded text-[10px] font-bold">OLLAMA (qwen2.5)</span>`;
+        } else if (log.source === 'fallback') {
+          sourceBadge = `<span class="badge-fallback px-2 py-0.5 rounded text-[10px] font-bold">SMART FALLBACK</span>`;
+        } else if (log.source === 'tflite_model') {
+          sourceBadge = `<span class="badge-tflite px-2 py-0.5 rounded text-[10px] font-bold">TFLite CNN</span>`;
+        } else if (log.source === 'pickle_model') {
+          sourceBadge = `<span class="badge-pickle px-2 py-0.5 rounded text-[10px] font-bold">RandomForest ML</span>`;
+        } else {
+          sourceBadge = `<span class="bg-slate-800 text-slate-300 border border-slate-700 px-2 py-0.5 rounded text-[10px] font-bold">${log.source}</span>`;
+        }
+
+        // Ollama Attempt Badge
+        const o = log.ollama_attempt || {};
+        let ollamaBadge = '';
+        if (o.status === 'success') {
+          ollamaBadge = `<span class="text-emerald-400 font-semibold"><i class="fa-solid fa-check mr-1"></i>Success (${o.duration_sec}s)</span>`;
+        } else if (o.status === 'timeout') {
+          ollamaBadge = `<span class="text-red-400 font-semibold" title="${o.error || ''}"><i class="fa-solid fa-clock-rotate-left mr-1"></i>Timeout (${o.duration_sec}s)</span>`;
+        } else if (o.status === 'error') {
+          ollamaBadge = `<span class="text-red-400 font-semibold" title="${o.error || ''}"><i class="fa-solid fa-triangle-exclamation mr-1"></i>Error (${o.error || ''})</span>`;
+        } else {
+          ollamaBadge = `<span class="text-slate-500">Skipped</span>`;
+        }
+
+        const payloadSummary = escapeHtml(JSON.stringify(log.request_body));
+
+        html += `
+          <tr class="hover:bg-slate-800/40 transition border-b border-slate-800/60">
+            <td class="p-3 whitespace-nowrap text-slate-400">
+              <span class="font-bold text-slate-200">#${log.id}</span><br>
+              <span class="text-[10px]">${log.timestamp}</span>
+            </td>
+            <td class="p-3 whitespace-nowrap">
+              <span class="font-bold text-emerald-300">${log.endpoint}</span><br>
+              <span class="text-[10px] text-slate-500">${log.method} &bull; ${log.client_ip}</span>
+            </td>
+            <td class="p-3 max-w-[200px]">
+              <div class="truncate text-slate-300 font-mono text-[11px]" title='${payloadSummary}'>${payloadSummary}</div>
+              <button onclick="viewDetails(${log.id})" class="text-[10px] text-emerald-400 hover:underline mt-0.5">Inspect Full Payload</button>
+            </td>
+            <td class="p-3 whitespace-nowrap">
+              ${ollamaBadge}
+            </td>
+            <td class="p-3 whitespace-nowrap">
+              ${sourceBadge}
+            </td>
+            <td class="p-3 whitespace-nowrap font-mono text-slate-300">
+              ${log.total_duration_ms} ms
+            </td>
+            <td class="p-3 max-w-[220px]">
+              <div class="flex items-center justify-between">
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${log.response_status === 200 ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-red-950 text-red-400 border border-red-800'}">HTTP ${log.response_status}</span>
+                <button onclick="viewDetails(${log.id})" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-[10px] rounded text-slate-200 border border-slate-700 transition">View JSON</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      });
+
+      tbody.innerHTML = html;
+    }
+
+    function filterLogs() {
+      renderLogsTable();
+    }
+
+    function viewDetails(logId) {
+      const log = rawLogs.find(l => l.id === logId);
+      if (!log) return;
+
+      document.getElementById('modal-title').innerHTML = `<i class="fa-solid fa-code text-emerald-400"></i> Request #${log.id} Details (${log.endpoint})`;
+      document.getElementById('modal-json').innerText = JSON.stringify(log, null, 2);
+      document.getElementById('json-modal').classList.remove('hidden');
+    }
+
+    function closeModal() {
+      document.getElementById('json-modal').classList.add('hidden');
+    }
+
+    function copyModalJson() {
+      const text = document.getElementById('modal-json').innerText;
+      navigator.clipboard.writeText(text);
+      alert("JSON copied to clipboard!");
+    }
+
+    async function clearLogs() {
+      if (!confirm("Are you sure you want to clear all request logs?")) return;
+      await fetch('/api/clear-logs', { method: 'POST' });
+      fetchLogs();
+    }
+
+    async function sendTestRemedy(diseaseName) {
+      await fetch('/disease-remedy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ diseaseName: diseaseName, cropName: "Potato", language: "English" })
+      });
+      fetchLogs();
+    }
+
+    async function sendTestGrowthPlan(cropName) {
+      await fetch('/generate-growth-plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cropName: cropName, soilType: "Loamy", season: "Kharif" })
+      });
+      fetchLogs();
+    }
+
+    async function sendTestCropRec() {
+      await fetch('/recommend-crop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ soilType: "black", season: "kharif", waterAvailability: "medium", farmSizeAcres: 3.5 })
+      });
+      fetchLogs();
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
+    function setupAutoRefresh() {
+      const select = document.getElementById('refresh-interval');
+      const val = parseInt(select.value);
+      if (timer) clearInterval(timer);
+
+      if (val > 0) {
+        timer = setInterval(fetchLogs, val);
+      }
+    }
+
+    document.getElementById('refresh-interval').addEventListener('change', setupAutoRefresh);
+
+    // Initial Load
+    fetchLogs();
+    checkTunnelStatus();
+    setupAutoRefresh();
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_content)
 
 
 if __name__ == "__main__":
