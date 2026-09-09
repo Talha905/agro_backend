@@ -135,9 +135,7 @@ async def health_check():
 # ----------------------------------------
 # 1. Disease Detection Endpoint (TFLite)
 # ----------------------------------------
-tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model_quantized.tflite")
-if not os.path.exists(tflite_model_path):
-    tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
+tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
 if not os.path.exists(tflite_model_path):
     tflite_model_path = os.path.join(BASE_DIR, "model.tflite")
 
@@ -198,7 +196,9 @@ async def predict_disease(request: Request, file: UploadFile = File(...)):
 
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
-        image = image.resize((256, 256))
+        target_h = input_details[0]['shape'][1] if len(input_details[0]['shape']) > 2 else 256
+        target_w = input_details[0]['shape'][2] if len(input_details[0]['shape']) > 2 else 256
+        image = image.resize((target_w, target_h))
 
         input_data = np.expand_dims(image, axis=0)
 
