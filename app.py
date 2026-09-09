@@ -135,11 +135,11 @@ async def health_check():
 # ----------------------------------------
 # 1. Disease Detection Endpoint (TFLite)
 # ----------------------------------------
-tflite_model_path = os.path.join(BASE_DIR, "model.tflite")
-if not os.path.exists(tflite_model_path):
-    tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model_quantized.tflite")
+tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model_quantized.tflite")
 if not os.path.exists(tflite_model_path):
     tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
+if not os.path.exists(tflite_model_path):
+    tflite_model_path = os.path.join(BASE_DIR, "model.tflite")
 
 interpreter = None
 input_details = None
@@ -205,8 +205,9 @@ async def predict_disease(request: Request, file: UploadFile = File(...)):
 
         input_data = np.expand_dims(image, axis=0)
 
+        # Note: Model contains built-in Rescaling(1./255) layer, so input must be raw float32 [0..255]
         if input_details[0]['dtype'] == np.float32:
-            input_data = input_data.astype(np.float32) / 255.0
+            input_data = input_data.astype(np.float32)
 
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
