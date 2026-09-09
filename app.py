@@ -14,7 +14,7 @@ from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 
 warnings.filterwarnings("ignore")
@@ -135,7 +135,9 @@ async def health_check():
 # ----------------------------------------
 # 1. Disease Detection Endpoint (TFLite)
 # ----------------------------------------
-tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
+tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model_quantized.tflite")
+if not os.path.exists(tflite_model_path):
+    tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
 if not os.path.exists(tflite_model_path):
     tflite_model_path = os.path.join(BASE_DIR, "model.tflite")
 
@@ -195,7 +197,8 @@ async def predict_disease(request: Request, file: UploadFile = File(...)):
             return res_body
 
         contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        image = Image.open(io.BytesIO(contents))
+        image = ImageOps.exif_transpose(image).convert("RGB")
         target_h = input_details[0]['shape'][1] if len(input_details[0]['shape']) > 2 else 256
         target_w = input_details[0]['shape'][2] if len(input_details[0]['shape']) > 2 else 256
         image = image.resize((target_w, target_h))
@@ -203,7 +206,7 @@ async def predict_disease(request: Request, file: UploadFile = File(...)):
         input_data = np.expand_dims(image, axis=0)
 
         if input_details[0]['dtype'] == np.float32:
-            input_data = (input_data.astype(np.float32) / 127.5) - 1.0
+            input_data = input_data.astype(np.float32) / 255.0
 
         interpreter.set_tensor(input_details[0]['index'], input_data)
         interpreter.invoke()
