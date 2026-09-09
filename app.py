@@ -135,7 +135,9 @@ async def health_check():
 # ----------------------------------------
 # 1. Disease Detection Endpoint (TFLite)
 # ----------------------------------------
-tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
+tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model_quantized.tflite")
+if not os.path.exists(tflite_model_path):
+    tflite_model_path = os.path.join(BASE_DIR, "plant_disease_model.tflite")
 if not os.path.exists(tflite_model_path):
     tflite_model_path = os.path.join(BASE_DIR, "model.tflite")
 
