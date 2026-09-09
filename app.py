@@ -214,8 +214,13 @@ async def predict_disease(request: Request, file: UploadFile = File(...)):
             scale, zero_point = output_details[0]['quantization']
             output = (output.astype(np.float32) - zero_point) * scale
 
-        exp_output = np.exp(output[0] - np.max(output[0]))
-        probabilities = exp_output / exp_output.sum()
+        raw_output = output[0]
+        # Check if the TFLite model output already includes Softmax probabilities
+        if abs(float(np.sum(raw_output)) - 1.0) < 0.05:
+            probabilities = raw_output
+        else:
+            exp_output = np.exp(raw_output - np.max(raw_output))
+            probabilities = exp_output / exp_output.sum()
 
         predicted_index = int(np.argmax(probabilities))
         predicted_class = labels.get(predicted_index, f"Disease Index {predicted_index}")
