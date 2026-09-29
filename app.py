@@ -36,7 +36,8 @@ app.add_middleware(
 )
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_VISION_MODEL = os.environ.get("OLLAMA_VISION_MODEL", "qwen2.5vl")
 
 # In-memory Request Log Ring Buffer (Max 100 logs)
 MAX_LOGS = 100
@@ -51,16 +52,16 @@ def record_log(log_data: dict):
     REQUEST_LOGS.appendleft(log_data)
 
 
-def query_ollama_detailed(prompt: str, system: str = "", format_json: bool = True, timeout: float = 35.0) -> tuple[dict | None, float, str, str | None]:
-    """Queries local or remote Ollama server running qwen2.5:3b model and returns detailed diagnostics."""
+def query_ollama_detailed(prompt: str, system: str = "", format_json: bool | dict = True, timeout: float = 45.0, model: str | None = None, images: list[str] | None = None) -> tuple[dict | None, float, str, str | None]:
+    """Queries local or remote Ollama server running qwen2.5:7b / qwen2.5vl model with optional structured JSON schema."""
     start_time = time.time()
     url = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": model or OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "num_predict": 350,
+            "num_predict": 450,
             "temperature": 0.2,
             "top_p": 0.9,
         }
@@ -68,6 +69,12 @@ def query_ollama_detailed(prompt: str, system: str = "", format_json: bool = Tru
     if system:
         payload["system"] = system
     if format_json:
+        if isinstance(format_json, dict):
+            payload["format"] = format_json
+        else:
+            payload["format"] = "json"
+    if images:
+        payload["images"] = images
         payload["format"] = "json"
 
     data = json.dumps(payload).encode("utf-8")
@@ -503,27 +510,62 @@ async def recommend_crop(req: RecommendationRequest, request: Request):
 
 
 # ----------------------------------------
-# 4. Growth Plan Generation Endpoint (Ollama qwen2.5:3b)
+# 4. Growth Plan Generation Endpoint (Ollama qwen2.5:7b + qwen2.5vl)
 # ----------------------------------------
 ALLOWED_STAGES = {"sowing", "germination", "vegetative", "flowering", "maturity"}
 
+GROWTH_PLAN_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cropName": {"type": "string"},
+        "stages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "durationDays": {"type": "integer"},
+                    "irrigationFrequencyDays": {"type": "integer"},
+                    "pestRisks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["name", "durationDays", "irrigationFrequencyDays", "pestRisks"]
+            }
+        },
+        "fertilizerPlan": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "stageName": {"type": "string"},
+                    "fertilizerType": {"type": "string"},
+                    "dayOffsetInStage": {"type": "integer"}
+                },
+                "required": ["stageName", "fertilizerType", "dayOffsetInStage"]
+            }
+        }
+    },
+    "required": ["cropName", "stages", "fertilizerPlan"]
+}
+
 GROWTH_PLAN_SYSTEM_PROMPT = (
-    "You are an agronomy expert for Indian crops. Output ONLY valid JSON with 5 stages (sowing, germination, vegetative, flowering, maturity) in this exact structure:\n"
-    "{\n"
-    '  "cropName": "Crop Name",\n'
-    '  "stages": [\n'
-    '    {"name": "sowing", "durationDays": 10, "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},\n'
-    '    {"name": "germination", "durationDays": 12, "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm"]},\n'
-    '    {"name": "vegetative", "durationDays": 35, "irrigationFrequencyDays": 7, "pestRisks": ["Aphids"]},\n'
-    '    {"name": "flowering", "durationDays": 30, "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm"]},\n'
-    '    {"name": "maturity", "durationDays": 25, "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]}\n'
-    '  ],\n'
-    '  "fertilizerPlan": [\n'
-    '    {"stageName": "sowing", "fertilizerType": "Basal NPK", "dayOffsetInStage": 0},\n'
-    '    {"stageName": "vegetative", "fertilizerType": "Urea", "dayOffsetInStage": 15}\n'
-    '  ]\n'
-    "}"
+    "You are a master agronomy expert for Indian agriculture. Calculate realistic, crop-specific growth stage lengths, "
+    "watering schedules in days, pest & disease risks per stage, and targeted fertilizer application timing based on "
+    "the crop species, soil profile, season, and region requested. Do not copy generic numbers. Use precise agronomic calculations."
 )
+
+# Reference range table used ONLY for server validation
+AGRONOMIC_REFERENCE_RANGES = {
+    "sowing": {"min_days": 3, "max_days": 25, "min_irrig": 1, "max_irrig": 10},
+    "germination": {"min_days": 4, "max_days": 30, "min_irrig": 1, "max_irrig": 12},
+    "vegetative": {"min_days": 10, "max_days": 180, "min_irrig": 2, "max_irrig": 15},
+    "flowering": {"min_days": 10, "max_days": 120, "min_irrig": 2, "max_irrig": 15},
+    "maturity": {"min_days": 10, "max_days": 180, "min_irrig": 3, "max_irrig": 20},
+}
+
+OLD_STATIC_TEMPLATE_DURATIONS = [10, 12, 35, 30, 25]
 
 
 class GrowthPlanRequest(BaseModel):
@@ -550,6 +592,11 @@ def _normalize_and_validate_template(data: dict, default_crop_name: str) -> dict
     if not isinstance(raw_stages, list) or len(raw_stages) < 3:
         raise ValueError("Insufficient stages returned")
 
+    # Reject old template with static numbers
+    durations = [int(s.get("durationDays") or 0) for s in raw_stages if isinstance(s, dict)]
+    if durations == OLD_STATIC_TEMPLATE_DURATIONS:
+        raise ValueError("Model returned old static template; rejecting for dynamic recalibration")
+
     stage_order = ["sowing", "germination", "vegetative", "flowering", "maturity"]
     normalized_stages = []
 
@@ -566,17 +613,21 @@ def _normalize_and_validate_template(data: dict, default_crop_name: str) -> dict
                 matched_name = target
                 break
 
+        ref_range = AGRONOMIC_REFERENCE_RANGES.get(matched_name, {"min_days": 3, "max_days": 180, "min_irrig": 1, "max_irrig": 20})
+        
         dur = s.get("durationDays") or s.get("duration_days") or s.get("duration") or 14
         try:
             dur = int(dur)
         except (ValueError, TypeError):
             dur = 14
+        dur = max(ref_range["min_days"], min(ref_range["max_days"], dur))
 
         irrig = s.get("irrigationFrequencyDays") or s.get("irrigation_frequency_days") or s.get("irrigation") or 7
         try:
             irrig = int(irrig)
         except (ValueError, TypeError):
             irrig = 7
+        irrig = max(ref_range["min_irrig"], min(ref_range["max_irrig"], irrig))
 
         pests = s.get("pestRisks") or s.get("pest_risks") or s.get("pests") or []
         if not isinstance(pests, list):
@@ -584,8 +635,8 @@ def _normalize_and_validate_template(data: dict, default_crop_name: str) -> dict
 
         normalized_stages.append({
             "name": matched_name,
-            "durationDays": max(1, dur),
-            "irrigationFrequencyDays": max(1, irrig),
+            "durationDays": dur,
+            "irrigationFrequencyDays": irrig,
             "pestRisks": [str(p) for p in pests if p],
         })
 
@@ -705,42 +756,52 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
 
     prompt_text = "\n".join(context_parts)
 
-    # 1. Try Ollama qwen2.5:3b (with 60s timeout)
-    ollama_res, dur_sec, ollama_status, ollama_err = query_ollama_detailed(prompt_text, system=GROWTH_PLAN_SYSTEM_PROMPT, format_json=True, timeout=60.0)
+    # 1. Try Ollama qwen2.5:7b with JSON Schema format & up to 2 retries
+    cleaned_template = None
+    last_err = None
 
-    if ollama_res and isinstance(ollama_res, dict):
-        try:
-            cleaned_template = _normalize_and_validate_template(ollama_res, request.cropName)
-            _growth_plan_cache[cache_key] = cleaned_template
-            _growth_plan_cache[crop_slug] = cleaned_template
-            res_body = {"success": True, "template": cleaned_template, "source": "ollama_qwen2.5"}
-            total_dur_ms = round((time.time() - start_time) * 1000, 1)
-            record_log({
-                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "endpoint": "/generate-growth-plan",
-                "method": "POST",
-                "client_ip": client_ip,
-                "request_body": request.dict(),
-                "ollama_attempt": {
-                    "host": OLLAMA_HOST,
-                    "model": OLLAMA_MODEL,
-                    "duration_sec": round(dur_sec, 2),
-                    "status": ollama_status,
-                    "error": ollama_err,
-                },
-                "source": "ollama_qwen2.5",
-                "response_status": 200,
-                "response_sent": True,
-                "response_body": res_body,
-                "total_duration_ms": total_dur_ms,
-            })
-            return res_body
-        except Exception as ve:
-            print(f"Ollama template normalization notice: {ve}")
-            if not ollama_err:
-                ollama_err = f"Template normalization error: {ve}"
+    for attempt in range(2):
+        ollama_res, dur_sec, ollama_status, ollama_err = query_ollama_detailed(
+            prompt_text,
+            system=GROWTH_PLAN_SYSTEM_PROMPT,
+            format_json=GROWTH_PLAN_JSON_SCHEMA,
+            timeout=65.0
+        )
+        if ollama_res and isinstance(ollama_res, dict):
+            try:
+                cleaned_template = _normalize_and_validate_template(ollama_res, request.cropName)
+                break
+            except Exception as ve:
+                last_err = str(ve)
+                print(f"Ollama attempt {attempt+1} validation notice: {ve}")
 
-    # 2. Instant Smart Agronomic Fallback (Zero Gemini, Zero 429 quota errors)
+    if cleaned_template:
+        _growth_plan_cache[cache_key] = cleaned_template
+        _growth_plan_cache[crop_slug] = cleaned_template
+        res_body = {"success": True, "template": cleaned_template, "source": "ollama_qwen2.5_7b"}
+        total_dur_ms = round((time.time() - start_time) * 1000, 1)
+        record_log({
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "endpoint": "/generate-growth-plan",
+            "method": "POST",
+            "client_ip": client_ip,
+            "request_body": request.dict(),
+            "ollama_attempt": {
+                "host": OLLAMA_HOST,
+                "model": OLLAMA_MODEL,
+                "duration_sec": round(dur_sec, 2),
+                "status": ollama_status,
+                "error": ollama_err,
+            },
+            "source": "ollama_qwen2.5_7b",
+            "response_status": 200,
+            "response_sent": True,
+            "response_body": res_body,
+            "total_duration_ms": total_dur_ms,
+        })
+        return res_body
+
+    # 2. Instant Smart Agronomic Fallback (Dynamic reference bounds)
     fallback_data = _generate_smart_fallback_template(request.cropName)
     _growth_plan_cache[cache_key] = fallback_data
     _growth_plan_cache[crop_slug] = fallback_data
@@ -757,7 +818,7 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
             "model": OLLAMA_MODEL,
             "duration_sec": round(dur_sec, 2),
             "status": ollama_status,
-            "error": ollama_err,
+            "error": last_err or ollama_err,
         },
         "source": "fallback",
         "response_status": 200,
@@ -766,6 +827,140 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
         "total_duration_ms": total_dur_ms,
     })
     return res_body
+
+
+@app.post("/adapt-growth-plan")
+@app.post("/adapt_growth_plan")
+async def adapt_growth_plan(
+    request: Request,
+    plan_json: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """Adapts an existing growth plan using qwen2.5vl vision observations and TFLite disease diagnosis."""
+    start_time = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+    try:
+        current_plan = json.loads(plan_json)
+        contents = await file.read()
+
+        # 1. Disease Detection with TFLite model
+        image = Image.open(io.BytesIO(contents))
+        image_rgb = ImageOps.exif_transpose(image).convert("RGB")
+        
+        disease_name = "Healthy"
+        disease_confidence = 0.0
+        if interpreter is not None:
+            target_h = input_details[0]['shape'][1] if len(input_details[0]['shape']) > 2 else 224
+            target_w = input_details[0]['shape'][2] if len(input_details[0]['shape']) > 2 else 224
+            resized = image_rgb.resize((target_w, target_h))
+            input_data = np.expand_dims(resized, axis=0).astype(np.float32) / 255.0
+            interpreter.set_tensor(input_details[0]['index'], input_data)
+            interpreter.invoke()
+            out = interpreter.get_tensor(output_details[0]['index'])[0]
+            if abs(float(np.sum(out)) - 1.0) >= 0.05:
+                exp_o = np.exp(out - np.max(out))
+                out = exp_o / exp_o.sum()
+            pred_idx = int(np.argmax(out))
+            disease_name = labels.get(pred_idx, f"Index {pred_idx}")
+            disease_confidence = float(out[pred_idx]) * 100.0
+
+        # 2. Vision observation with qwen2.5vl (base64 image)
+        import base64
+        b64_img = base64.b64encode(contents).decode("utf-8")
+        v_prompt = (
+            "Analyze this crop photo carefully. Describe the current crop growth stage "
+            "(sowing, germination, vegetative, flowering, or maturity) and visual leaf/canopy health symptoms."
+        )
+        v_res, _, _, _ = query_ollama_detailed(
+            v_prompt,
+            system="You are an expert agricultural vision model.",
+            format_json=False,
+            timeout=45.0,
+            model=OLLAMA_VISION_MODEL,
+            images=[b64_img]
+        )
+        vision_obs = v_res.get("response", "Crop foliage visible; stage appears active.") if v_res else "Visual observation unavailable."
+
+        # 3. Confidence threshold check (>= 50%)
+        apply_overrides = disease_confidence >= 50.0
+
+        # 4. Recalibration with qwen2.5:7b
+        recal_prompt = (
+            f"Original Growth Plan:\n{json.dumps(current_plan)}\n\n"
+            f"Image Visual Observation ({OLLAMA_VISION_MODEL}): {vision_obs}\n"
+            f"TFLite Disease Diagnosis: {disease_name} (Confidence: {disease_confidence:.1f}%)\n\n"
+            f"Recalibrate the growth plan if needed. "
+            f"Rule: Stage duration changes MUST be capped to a maximum of +/- 30% (or +/- 7 days max per stage). "
+            f"Provide the updated growth plan in JSON format."
+        )
+        recal_res, _, _, _ = query_ollama_detailed(
+            recal_prompt,
+            system=GROWTH_PLAN_SYSTEM_PROMPT,
+            format_json=GROWTH_PLAN_JSON_SCHEMA,
+            timeout=65.0,
+            model=OLLAMA_MODEL
+        )
+
+        updated_plan = current_plan
+        diff_list = []
+
+        if recal_res and isinstance(recal_res, dict):
+            try:
+                candidate_plan = _normalize_and_validate_template(recal_res, current_plan.get("cropName", "Crop"))
+                
+                # Enforce stage duration caps (max +/- 30% or max +/-7 days per stage)
+                orig_stages = {s["name"]: s for s in current_plan.get("stages", [])}
+                updated_stages = []
+                
+                for new_s in candidate_plan.get("stages", []):
+                    name = new_s["name"]
+                    old_dur = orig_stages.get(name, {}).get("durationDays", new_s["durationDays"])
+                    
+                    # Cap change to max 30% or 7 days
+                    max_delta = max(1, min(7, int(round(old_dur * 0.30))))
+                    new_dur = new_s["durationDays"]
+                    
+                    if abs(new_dur - old_dur) > max_delta:
+                        new_dur = old_dur + max_delta if new_dur > old_dur else old_dur - max_delta
+                    
+                    new_s["durationDays"] = new_dur
+                    updated_stages.append(new_s)
+
+                    if new_dur != old_dur:
+                        diff_list.append({
+                            "stage": name,
+                            "field": "durationDays",
+                            "oldValue": f"{old_dur} days",
+                            "newValue": f"{new_dur} days",
+                            "reason": f"Recalibrated based on vision stage observation & {disease_name} diagnosis"
+                        })
+
+                candidate_plan["stages"] = updated_stages
+                updated_plan = candidate_plan
+            except Exception as ve:
+                print(f"Recalibration validation notice: {ve}")
+
+        if not diff_list:
+            diff_list.append({
+                "stage": "current",
+                "field": "healthStatus",
+                "oldValue": "Routine Schedule",
+                "newValue": f"Diagnosed: {disease_name}",
+                "reason": f"Image verified with {disease_confidence:.1f}% confidence. Recommended preventive care."
+            })
+
+        res_body = {
+            "success": True,
+            "diseaseDetected": disease_name,
+            "confidence": round(disease_confidence, 2),
+            "visionObservation": vision_obs,
+            "updatedPlan": updated_plan,
+            "diff": diff_list
+        }
+        return res_body
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ----------------------------------------
