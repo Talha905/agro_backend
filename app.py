@@ -690,15 +690,44 @@ def _normalize_and_validate_template(data: dict, default_crop_name: str) -> dict
 
 
 def _generate_smart_fallback_template(crop_name: str) -> dict:
-    name = crop_name.strip().title() if crop_name.strip() else "Custom Crop"
+    raw_name = crop_name.strip() if crop_name else ""
+    clean_name = re.sub(r'<[^>]*?>', '', raw_name).strip()[:50]
+    name = clean_name.title() if clean_name else "Custom Crop"
+    lower_name = name.lower()
+
+    if "sugarcane" in lower_name:
+        durations = {"sowing": 15, "germination": 30, "vegetative": 150, "flowering": 75, "maturity": 60}
+    elif "cotton" in lower_name:
+        durations = {"sowing": 10, "germination": 15, "vegetative": 50, "flowering": 50, "maturity": 40}
+    elif "banana" in lower_name:
+        durations = {"sowing": 15, "germination": 25, "vegetative": 140, "flowering": 70, "maturity": 50}
+    elif "rice" in lower_name or "paddy" in lower_name or "धान" in lower_name or "तांदूळ" in lower_name:
+        durations = {"sowing": 10, "germination": 15, "vegetative": 45, "flowering": 35, "maturity": 30}
+    elif "wheat" in lower_name or "गेहूं" in lower_name or "गहू" in lower_name:
+        durations = {"sowing": 10, "germination": 12, "vegetative": 40, "flowering": 33, "maturity": 25}
+    elif "onion" in lower_name or "प्याज" in lower_name or "कांदा" in lower_name:
+        durations = {"sowing": 10, "germination": 15, "vegetative": 35, "flowering": 30, "maturity": 25}
+    elif "chickpea" in lower_name or "gram" in lower_name or "चना" in lower_name or "हरभरा" in lower_name:
+        durations = {"sowing": 8, "germination": 12, "vegetative": 35, "flowering": 28, "maturity": 22}
+    elif "maize" in lower_name or "corn" in lower_name or "मक्का" in lower_name or "मका" in lower_name:
+        durations = {"sowing": 7, "germination": 10, "vegetative": 35, "flowering": 28, "maturity": 20}
+    elif "tomato" in lower_name or "टमाटर" in lower_name or "टोमॅटो" in lower_name:
+        durations = {"sowing": 7, "germination": 10, "vegetative": 33, "flowering": 25, "maturity": 20}
+    elif "soybean" in lower_name or "सोयाबीन" in lower_name:
+        durations = {"sowing": 7, "germination": 10, "vegetative": 33, "flowering": 25, "maturity": 20}
+    elif "watermelon" in lower_name or "तरबूज" in lower_name or "कलिंगड" in lower_name:
+        durations = {"sowing": 6, "germination": 9, "vegetative": 30, "flowering": 22, "maturity": 18}
+    else:
+        durations = {"sowing": 10, "germination": 12, "vegetative": 40, "flowering": 33, "maturity": 25}
+
     return {
         "cropName": name,
         "stages": [
-            {"name": "sowing", "durationDays": 10, "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},
-            {"name": "germination", "durationDays": 12, "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm", "Damping Off"]},
-            {"name": "vegetative", "durationDays": 35, "irrigationFrequencyDays": 7, "pestRisks": ["Aphids", "Leaf Spot"]},
-            {"name": "flowering", "durationDays": 30, "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm", "Blight"]},
-            {"name": "maturity", "durationDays": 25, "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]},
+            {"name": "sowing", "durationDays": durations["sowing"], "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},
+            {"name": "germination", "durationDays": durations["germination"], "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm", "Damping Off"]},
+            {"name": "vegetative", "durationDays": durations["vegetative"], "irrigationFrequencyDays": 7, "pestRisks": ["Aphids", "Leaf Spot"]},
+            {"name": "flowering", "durationDays": durations["flowering"], "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm", "Blight"]},
+            {"name": "maturity", "durationDays": durations["maturity"], "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]},
         ],
         "fertilizerPlan": [
             {"stageName": "sowing", "fertilizerType": "Basal NPK", "dayOffsetInStage": 0},
