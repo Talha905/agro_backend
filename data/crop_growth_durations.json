@@ -1,0 +1,86 @@
+{
+  "sugarcane": {
+    "sowing": 15,
+    "germination": 30,
+    "vegetative": 150,
+    "flowering": 75,
+    "maturity": 60
+  },
+  "cotton": {
+    "sowing": 10,
+    "germination": 15,
+    "vegetative": 50,
+    "flowering": 50,
+    "maturity": 40
+  },
+  "banana": {
+    "sowing": 15,
+    "germination": 25,
+    "vegetative": 140,
+    "flowering": 70,
+    "maturity": 50
+  },
+  "rice": {
+    "sowing": 10,
+    "germination": 15,
+    "vegetative": 45,
+    "flowering": 35,
+    "maturity": 30
+  },
+  "wheat": {
+    "sowing": 10,
+    "germination": 12,
+    "vegetative": 40,
+    "flowering": 33,
+    "maturity": 25
+  },
+  "onion": {
+    "sowing": 10,
+    "germination": 15,
+    "vegetative": 35,
+    "flowering": 30,
+    "maturity": 25
+  },
+  "chickpea": {
+    "sowing": 8,
+    "germination": 12,
+    "vegetative": 35,
+    "flowering": 28,
+    "maturity": 22
+  },
+  "maize": {
+    "sowing": 7,
+    "germination": 10,
+    "vegetative": 35,
+    "flowering": 28,
+    "maturity": 20
+  },
+  "tomato": {
+    "sowing": 7,
+    "germination": 10,
+    "vegetative": 33,
+    "flowering": 25,
+    "maturity": 20
+  },
+  "soybean": {
+    "sowing": 7,
+    "germination": 10,
+    "vegetative": 33,
+    "flowering": 25,
+    "maturity": 20
+  },
+  "watermelon": {
+    "sowing": 6,
+    "germination": 9,
+    "vegetative": 30,
+    "flowering": 22,
+    "maturity": 18
+  },
+  "default": {
+    "sowing": 10,
+    "germination": 12,
+    "vegetative": 40,
+    "flowering": 33,
+    "maturity": 25
+  }
+}

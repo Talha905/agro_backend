@@ -689,45 +689,45 @@ def _normalize_and_validate_template(data: dict, default_crop_name: str) -> dict
     }
 
 
+CROP_DURATIONS_FILE = os.path.join(BASE_DIR, "data", "crop_growth_durations.json")
+_crop_durations_data: dict = {}
+if os.path.exists(CROP_DURATIONS_FILE):
+    try:
+        with open(CROP_DURATIONS_FILE, "r", encoding="utf-8") as f:
+            _crop_durations_data = json.load(f)
+    except Exception as _e:
+        print(f"Warning: Failed to load crop_growth_durations.json: {_e}")
+
+
 def _generate_smart_fallback_template(crop_name: str) -> dict:
     raw_name = crop_name.strip() if crop_name else ""
     clean_name = re.sub(r'<[^>]*?>', '', raw_name).strip()[:50]
     name = clean_name.title() if clean_name else "Custom Crop"
     lower_name = name.lower()
 
-    if "sugarcane" in lower_name:
-        durations = {"sowing": 15, "germination": 30, "vegetative": 150, "flowering": 75, "maturity": 60}
-    elif "cotton" in lower_name:
-        durations = {"sowing": 10, "germination": 15, "vegetative": 50, "flowering": 50, "maturity": 40}
-    elif "banana" in lower_name:
-        durations = {"sowing": 15, "germination": 25, "vegetative": 140, "flowering": 70, "maturity": 50}
-    elif "rice" in lower_name or "paddy" in lower_name or "धान" in lower_name or "तांदूळ" in lower_name:
-        durations = {"sowing": 10, "germination": 15, "vegetative": 45, "flowering": 35, "maturity": 30}
-    elif "wheat" in lower_name or "गेहूं" in lower_name or "गहू" in lower_name:
-        durations = {"sowing": 10, "germination": 12, "vegetative": 40, "flowering": 33, "maturity": 25}
-    elif "onion" in lower_name or "प्याज" in lower_name or "कांदा" in lower_name:
-        durations = {"sowing": 10, "germination": 15, "vegetative": 35, "flowering": 30, "maturity": 25}
-    elif "chickpea" in lower_name or "gram" in lower_name or "चना" in lower_name or "हरभरा" in lower_name:
-        durations = {"sowing": 8, "germination": 12, "vegetative": 35, "flowering": 28, "maturity": 22}
-    elif "maize" in lower_name or "corn" in lower_name or "मक्का" in lower_name or "मका" in lower_name:
-        durations = {"sowing": 7, "germination": 10, "vegetative": 35, "flowering": 28, "maturity": 20}
-    elif "tomato" in lower_name or "टमाटर" in lower_name or "टोमॅटो" in lower_name:
-        durations = {"sowing": 7, "germination": 10, "vegetative": 33, "flowering": 25, "maturity": 20}
-    elif "soybean" in lower_name or "सोयाबीन" in lower_name:
-        durations = {"sowing": 7, "germination": 10, "vegetative": 33, "flowering": 25, "maturity": 20}
-    elif "watermelon" in lower_name or "तरबूज" in lower_name or "कलिंगड" in lower_name:
-        durations = {"sowing": 6, "germination": 9, "vegetative": 30, "flowering": 22, "maturity": 18}
+    matched_key = None
+    for key in _crop_durations_data:
+        if key != "default" and key in lower_name:
+            matched_key = key
+            break
+
+    if matched_key:
+        durations = _crop_durations_data[matched_key]
+    elif "default" in _crop_durations_data:
+        durations = _crop_durations_data["default"]
     else:
         durations = {"sowing": 10, "germination": 12, "vegetative": 40, "flowering": 33, "maturity": 25}
 
     return {
         "cropName": name,
+        "isEstimated": True,
+        "source": "estimated_fallback",
         "stages": [
-            {"name": "sowing", "durationDays": durations["sowing"], "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},
-            {"name": "germination", "durationDays": durations["germination"], "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm", "Damping Off"]},
-            {"name": "vegetative", "durationDays": durations["vegetative"], "irrigationFrequencyDays": 7, "pestRisks": ["Aphids", "Leaf Spot"]},
-            {"name": "flowering", "durationDays": durations["flowering"], "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm", "Blight"]},
-            {"name": "maturity", "durationDays": durations["maturity"], "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]},
+            {"name": "sowing", "durationDays": durations.get("sowing", 10), "irrigationFrequencyDays": 5, "pestRisks": ["Soil Pests"]},
+            {"name": "germination", "durationDays": durations.get("germination", 12), "irrigationFrequencyDays": 6, "pestRisks": ["Cutworm", "Damping Off"]},
+            {"name": "vegetative", "durationDays": durations.get("vegetative", 40), "irrigationFrequencyDays": 7, "pestRisks": ["Aphids", "Leaf Spot"]},
+            {"name": "flowering", "durationDays": durations.get("flowering", 33), "irrigationFrequencyDays": 7, "pestRisks": ["Bollworm", "Blight"]},
+            {"name": "maturity", "durationDays": durations.get("maturity", 25), "irrigationFrequencyDays": 10, "pestRisks": ["Fungal Rot"]},
         ],
         "fertilizerPlan": [
             {"stageName": "sowing", "fertilizerType": "Basal NPK", "dayOffsetInStage": 0},
@@ -758,7 +758,7 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
 
     if cache_key in _growth_plan_cache or crop_slug in _growth_plan_cache:
         cached_tpl = _growth_plan_cache.get(cache_key) or _growth_plan_cache.get(crop_slug)
-        res_body = {"success": True, "template": cached_tpl, "cached": True}
+        res_body = {"success": True, "template": cached_tpl, "cached": True, "isEstimated": cached_tpl.get("isEstimated", True)}
         total_dur_ms = round((time.time() - start_time) * 1000, 1)
         record_log({
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -788,6 +788,9 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
     # 1. Try Ollama qwen2.5:7b with JSON Schema format & up to 2 retries
     cleaned_template = None
     last_err = None
+    dur_sec = 0.0
+    ollama_status = "unattempted"
+    ollama_err = None
 
     for attempt in range(2):
         ollama_res, dur_sec, ollama_status, ollama_err = query_ollama_detailed(
@@ -799,15 +802,32 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
         if ollama_res and isinstance(ollama_res, dict):
             try:
                 cleaned_template = _normalize_and_validate_template(ollama_res, request.cropName)
+                cleaned_template["isEstimated"] = False
+                cleaned_template["source"] = "ollama_qwen2.5_7b"
                 break
             except Exception as ve:
                 last_err = str(ve)
                 print(f"Ollama attempt {attempt+1} validation notice: {ve}")
 
+    ollama_meta = {
+        "url": f"{OLLAMA_HOST.rstrip('/')}/api/generate",
+        "host": OLLAMA_HOST,
+        "model": OLLAMA_MODEL,
+        "duration_sec": round(dur_sec, 2),
+        "status": ollama_status,
+        "error": last_err or ollama_err,
+    }
+
     if cleaned_template:
         _growth_plan_cache[cache_key] = cleaned_template
         _growth_plan_cache[crop_slug] = cleaned_template
-        res_body = {"success": True, "template": cleaned_template, "source": "ollama_qwen2.5_7b"}
+        res_body = {
+            "success": True,
+            "template": cleaned_template,
+            "isEstimated": False,
+            "source": "ollama_qwen2.5_7b",
+            "ollama_attempt": ollama_meta,
+        }
         total_dur_ms = round((time.time() - start_time) * 1000, 1)
         record_log({
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -815,13 +835,7 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
             "method": "POST",
             "client_ip": client_ip,
             "request_body": request.dict(),
-            "ollama_attempt": {
-                "host": OLLAMA_HOST,
-                "model": OLLAMA_MODEL,
-                "duration_sec": round(dur_sec, 2),
-                "status": ollama_status,
-                "error": ollama_err,
-            },
+            "ollama_attempt": ollama_meta,
             "source": "ollama_qwen2.5_7b",
             "response_status": 200,
             "response_sent": True,
@@ -830,11 +844,17 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
         })
         return res_body
 
-    # 2. Instant Smart Agronomic Fallback (Dynamic reference bounds)
+    # 2. Agronomic Fallback (Dynamic reference bounds from crop_growth_durations.json)
     fallback_data = _generate_smart_fallback_template(request.cropName)
     _growth_plan_cache[cache_key] = fallback_data
     _growth_plan_cache[crop_slug] = fallback_data
-    res_body = {"success": True, "template": fallback_data, "fallback": True}
+    res_body = {
+        "success": True,
+        "template": fallback_data,
+        "isEstimated": True,
+        "source": "estimated_fallback",
+        "ollama_attempt": ollama_meta,
+    }
     total_dur_ms = round((time.time() - start_time) * 1000, 1)
     record_log({
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -842,13 +862,7 @@ async def generate_growth_plan(request: GrowthPlanRequest, req_obj: Request):
         "method": "POST",
         "client_ip": client_ip,
         "request_body": request.dict(),
-        "ollama_attempt": {
-            "host": OLLAMA_HOST,
-            "model": OLLAMA_MODEL,
-            "duration_sec": round(dur_sec, 2),
-            "status": ollama_status,
-            "error": last_err or ollama_err,
-        },
+        "ollama_attempt": ollama_meta,
         "source": "fallback",
         "response_status": 200,
         "response_sent": True,
